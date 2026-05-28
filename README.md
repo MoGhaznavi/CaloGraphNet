@@ -71,10 +71,10 @@ ROOT File (ROD format from ATLAS)
        ↓
 ╔══════════════════════════════════════════════════════════════════╗
 ║              build_graph_dataset.py                              ║
-║  - Reads cell-level branches (energy, noise, eta, phi, etc.)    ║
-║  - Builds graph connectivity from neighbor information          ║
+║  - Reads cell-level branches (energy, noise, eta, phi, etc.)     ║
+║  - Builds graph connectivity from neighbor information           ║
 ║  - Defines geometry via CELL_SIZES mapping                       ║
-║  - Computes per-cell noise statistics across all events         ║
+║  - Computes per-cell noise statistics across all events          ║
 ║  - Saves 4 output files                                          ║
 ╚══════════════════════════════════════════════════════════════════╝
        ↓
@@ -82,11 +82,11 @@ ROOT File (ROD format from ATLAS)
        ↓
 ╔══════════════════════════════════════════════════════════════════╗
 ║              train_gnn_models.py                                 ║
-║  - Loads dataset with feature selection (baseline vs all)       ║
-║  - Builds GNN model (GCN, GAT, Transformer, or SAGE)           ║
-║  - Trains with weighted loss for class imbalance                ║
-║  - Evaluates with comprehensive metrics (F1 Sum Score, etc.)    ║
-║  - Saves model checkpoints and predictions (Parquet format)     ║
+║  - Loads dataset with feature selection (baseline vs all)        ║
+║  - Builds GNN model (GCN, GAT, Transformer, or SAGE)             ║
+║  - Trains with weighted loss for class imbalance                 ║
+║  - Evaluates with comprehensive metrics (F1 Sum Score, etc.)     ║
+║  - Saves model checkpoints and predictions (Parquet format)      ║
 ╚══════════════════════════════════════════════════════════════════╝
        ↓
   Trained Model + Predictions + Metrics
