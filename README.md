@@ -123,7 +123,7 @@ All outputs are saved in: `output_dir/{dataset_name}/`
   - Creates undirected edges (ensures src < dst)
   - Removes duplicate edges
   - Orders edges by source cell for efficient lookup
-- **Size**: Typically millions to hundreds of millions of edges
+- **Size**: In the case of the ATLAS calorimeter, around 1.2 million pairs
 
 #### 2. `cells_{dataset_name}.npy`
 - **Format**: Structured NumPy array, shape `(num_cells,)` with named fields
