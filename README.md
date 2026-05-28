@@ -1,4 +1,4 @@
-```markdown
+
 # CaloGraphNet
 
 > **Graph Neural Networks for Calorimeter Cell Clustering in Particle Physics**
@@ -65,7 +65,7 @@ For each edge (cell pair), the model predicts one of **5 classes**:
 
 ## Pipeline Architecture
 
-```
+
 ROOT File (xAOD format from ATLAS)
        ↓
 ╔══════════════════════════════════════════════════════════════════╗
@@ -89,7 +89,7 @@ ROOT File (xAOD format from ATLAS)
 ╚══════════════════════════════════════════════════════════════════╝
        ↓
   Trained Model + Predictions + Metrics
-```
+
 
 ---
 
