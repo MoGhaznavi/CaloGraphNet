@@ -2,6 +2,7 @@
 # CaloGraphNet
 
 > **Graph Neural Networks for Calorimeter Cell Clustering in Particle Physics**
+> 
 > Processes ATLAS ROOT files into graph datasets and trains GNNs (GCN, GAT, Graph Transformer, SAGE) for edge classification.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
