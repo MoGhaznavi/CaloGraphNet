@@ -66,8 +66,8 @@ For each edge (cell pair), the model predicts one of **5 classes**:
 
 ## Pipeline Architecture
 
-
-ROOT File (xAOD format from ATLAS)
+```
+ROOT File (ROD format from ATLAS)
        ↓
 ╔══════════════════════════════════════════════════════════════════╗
 ║              build_graph_dataset.py                              ║
@@ -90,7 +90,7 @@ ROOT File (xAOD format from ATLAS)
 ╚══════════════════════════════════════════════════════════════════╝
        ↓
   Trained Model + Predictions + Metrics
-
+```
 
 ---
 
