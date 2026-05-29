@@ -282,7 +282,7 @@ All models follow the same unified design:
 ```
 Input: Node features (N_cells × F)
        ↓
-Node Embedding (Linear: F → hidden_dim) (1 dense layer with relu activation)
+Node Embedding (Linear: F → hidden_dim) (1 dense layer FIX THIS DESCRIPTION)
        ↓
 L GNN Layers (configurable)
   ├── Message passing (GCNConv / GATConv / TransformerConv / SAGEConv)
