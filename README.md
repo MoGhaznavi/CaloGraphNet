@@ -67,7 +67,7 @@ For each edge (cell pair), the model predicts one of **5 classes**:
 ## Pipeline Architecture
 
 ```
-ROOT File (produced from ROD format)
+ROOT File (produced from RDO format)
        ↓
 ╔══════════════════════════════════════════════════════════════════╗
 ║              build_graph_dataset.py                              ║
