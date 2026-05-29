@@ -112,7 +112,6 @@ ROOT File (produced from RDO format)
 ║  - Reads cell-level branches (energy, noise, eta, phi, etc.)     ║
 ║  - Builds graph connectivity from neighbor information           ║
 ║  - Defines geometry via CELL_SIZES mapping                       ║
-║  - Computes per-cell noise statistics across all events          ║
 ║  - Saves 4 output files                                          ║
 ╚══════════════════════════════════════════════════════════════════╝
        ↓
