@@ -1078,9 +1078,9 @@ An FSS of 2.75 means:
 - Perfect would be F1 = 1.00 per class (FSS = 5.0)
 - We're about halfway between random and perfect
 
-**Class-specific performance from our best model (SAGE + focal):**
+**Example of Class-specific performance**
 
-| Class | Likely F1 | Interpretation |
+| Class | Example F1 | Interpretation |
 |-------|-----------|----------------|
 | Class 0 (Lone-Lone) | ~0.92 | Very good (easy class) |
 | Class 1 (Same Cluster) | ~0.45 | Poor - can't identify same-cluster pairs |
