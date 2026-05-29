@@ -442,23 +442,7 @@ python train_gnn_models.py \
 | `--patience` | 10 | Early stopping patience |
 
 ---
-Perfect! You should add the **File 3: analyze_results.py** section right after **File 2: train_gnn_models.py** and before **Quick Start**. Here's the expanded section with all the details:
 
-## Where to add in your README
-
-Insert this **after** the `train_gnn_models.py` section and **before** the `Quick Start` section:
-
-```
-## File 2: train_gnn_models.py
-... (your existing content) ...
-
-## File 3: analyze_results.py    <-- ADD THIS HERE
-
-## Quick Start
-... (your existing content) ...
-```
-
----
 ## File 3: analyze_results.py
 
 ### What it does
