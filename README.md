@@ -245,11 +245,12 @@ This script loads the dataset created by `build_graph_dataset.py`, trains Graph 
 **Key operations:**
 1. Loads features with user selection (baseline 3-feature or all 42+ features)
 2. Splits events into train/test sets (default 70/30)
-3. Builds a GNN model (GCN, GAT, Graph Transformer, or GraphSAGE)
-4. Sets up loss function (standard, weighted, or focal loss for class imbalance)
-5. Trains with mixed precision (FP16) for faster GPU training
-6. Evaluates using comprehensive metrics including F1 Sum Score (class imbalance-aware)
-7. Saves best model checkpoint and prediction results (Parquet format)
+3. Using custom generator to read the data and construct the batches
+4. Builds a GNN model (GCN, GAT, Graph Transformer, or GraphSAGE)
+5. Sets up loss function (standard, weighted, or focal loss for class imbalance)
+6. Trains with mixed precision (FP16) for faster GPU training
+7. Evaluates using comprehensive metrics including F1 Sum Score (class imbalance-aware)
+8. Saves best model checkpoint and prediction results (Parquet format)
 
 ### Feature Sets
 
