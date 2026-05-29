@@ -893,3 +893,235 @@ Experiment:
   --resume              Resume from checkpoint (default: True)
   --debug               Debug mode (only runs a few events)
 ```
+
+## Current Limitations & Lessons Learned
+
+### The Challenge: Why Performance Isn't Where We Want It
+
+Despite experimenting with multiple architectures (GCN, GAT, Graph Transformer, GraphSAGE), feature sets, and loss functions, the best model achieves an **F1 Sum Score of only 2.75** (where 5.0 would be perfect). This section documents what we've learned from our experiments and where we believe the fundamental issues lie.
+
+### Our Best Results So Far
+
+From 11 trained models, here are the top performers:
+
+| Rank | Model | F1 Sum Score | Accuracy | Macro F1 | Key Features |
+|------|-------|--------------|----------|----------|--------------|
+| 1 | SAGE (8 layers, focal loss) | **2.75** | 95.1% | 0.55 | Baseline features |
+| 2 | Transformer (8 heads, focal loss) | 2.63 | 94.0% | 0.53 | Baseline features |
+| 3 | SAGE (all features, inverse loss) | 2.31 | 86.4% | 0.46 | All 42+ features |
+| 4 | SAGE (inverse loss) | 2.25 | 84.9% | 0.45 | Baseline |
+| 5 | Transformer (inverse loss) | 2.25 | 85.3% | 0.45 | Baseline |
+
+**Key observation:** The best models achieve **~95% accuracy** but only **~2.75 FSS** (55% of perfect). This massive gap between accuracy and FSS tells us something important.
+
+### Lesson 1: Accuracy is Dangerously Misleading for Imbalanced Data
+
+**The problem:** In our dataset, Class 0 (Lone-Lone / noise-noise) dominates with ~92% of all edges. A trivial model that predicts **every edge as Class 0** achieves:
+- **Accuracy: 92%** (looks excellent! ✅)
+- **F1 Sum Score: ~1.2** (close to random baseline of 1.0 ❌)
+- **Macro F1: ~0.20** (fails on all other classes ❌)
+
+**Our actual best model vs trivial baseline:**
+
+| Metric | Trivial Model (all Class 0) | Our Best Model (SAGE + focal) | Improvement |
+|--------|----------------------------|-------------------------------|-------------|
+| Accuracy | 92.0% | 95.1% | +3.1% |
+| F1 Sum Score | ~1.2 | **2.75** | +129% |
+| Macro F1 | ~0.20 | **0.55** | +175% |
+
+**Our solution:** We abandoned accuracy entirely as a meaningful metric and adopted:
+- **F1 Sum Score (FSS)** = Σ(F1 per class) - **Accounts for BOTH False Positives AND False Negatives**
+- Perfect score = 5.0 (all classes perfect)
+- Random baseline = 1.0 (all classes at chance)
+
+**Why FSS is superior:** The trivial "all Class 0" model scores:
+- Accuracy: 92% (seems good)
+- FSS: 1.2 (clearly terrible - reveals the problem)
+
+### Lesson 2: Focal Loss Helps, But Doesn't Solve the Core Issue
+
+Notice that our top 2 models both use **focal loss** (γ=2.0), while inverse-weighted models perform worse:
+
+| Loss Function | Best FSS | Best Accuracy | Notes |
+|---------------|----------|---------------|-------|
+| **Focal (γ=2.0)** | **2.75** | 95.1% | Best overall |
+| Inverse | 2.31 | 86.4% | Worse accuracy, lower FSS |
+| Logarithmic | 2.22 | 93.7% | Mid-range |
+
+**What this tells us:** Focal loss helps (especially with class imbalance), but even the best focal loss model only reaches FSS 2.75. The ceiling isn't loss function-related.
+
+### Lesson 3: More Features Don't Always Help (Surprising Finding!)
+
+Counter-intuitively, **all-features mode (42+ features) performed WORSE than baseline (3 features):**
+
+| Model | Features | FSS | Accuracy | Macro F1 |
+|-------|----------|-----|----------|----------|
+| SAGE + focal | Baseline (3) | **2.75** | 95.1% | 0.55 |
+| SAGE + inverse | All (42+) | 2.31 | 86.4% | 0.46 |
+
+**Possible explanations:**
+1. **Overfitting:** 42+ features on 1.2M edges may cause overfitting despite regularization
+2. **Noise in features:** Some features (noise_category, cluster_id_norm) may be correlated with the label in ways that hurt generalization
+3. **Redundancy:** The extra features may not add independent signal
+
+**What we learned:** More data isn't always better. Feature engineering requires careful selection.
+
+### Lesson 4: Architecture Differences Are Smaller Than Expected
+
+Despite large architectural differences, performance varies only modestly:
+
+| Architecture | Best FSS | Best Macro F1 | Notes |
+|--------------|----------|---------------|-------|
+| GraphSAGE | **2.75** | 0.55 | Winner (8 layers, focal) |
+| Transformer | 2.63 | 0.53 | Attention doesn't help much |
+| GCN | 2.23 | 0.45 | Simpler, but worse |
+| GAT | 2.19 | 0.44 | Attention without global context? |
+
+**Key insight:** The gap between SAGE (best) and GCN (worst) is only ~0.5 FSS. All architectures seem to hit a similar ceiling around FSS 2.5-2.8.
+
+### Lesson 5: The Core Issue May Be Graph Construction Itself
+
+Given that:
+- ✅ We tried 4 different architectures (GCN, GAT, Transformer, SAGE)
+- ✅ We tried 3 loss functions (focal, inverse, logarithmic)
+- ✅ We tried 2 feature sets (baseline vs all 42+)
+- ✅ We varied hyperparameters (layers, heads, learning rate)
+- ❌ Best FSS still only **2.75** (55% of perfect)
+
+**Our current hypothesis:** We're framing this as a **node classification with fixed graph** problem, but physics suggests it should be a **graph learning problem**.
+
+**The physics reality:**
+- A single calorimeter cell can receive energy from **multiple overlapping particle showers**
+- In high-energy environments, clusters **overlap spatially**
+- A cell doesn't belong to a single cluster - it has **fractional energy contributions** from multiple clusters
+
+**The mismatch in our current approach:**
+```
+Reality:                     Our Model:
+┌─────────────────┐          ┌─────────────────┐
+│  Cluster A      │          │  Node: Cell X   │
+│    ┌───┐        │          │  Question:      │
+│    │ X │ 30%    │          │  "Which single  │
+│    └───┘        │          │   cluster does  │
+│         Cluster │          │   this cell     │
+│         B 70%   │          │   belong to?"   │
+└─────────────────┘          └─────────────────┘
+                             
+Problem: The question itself may be wrong!
+Cell X belongs to BOTH clusters (30% A, 70% B)
+```
+
+### Why This Explains Our Results
+
+| Observation | Explanation under Graph Learning Hypothesis |
+|-------------|---------------------------------------------|
+| Best FSS stuck at 2.75 | Hard labels can't represent fractional membership |
+| SAGE > Transformer | Local aggregation may be better for overlapping clusters than global attention |
+| More features hurt | Adding cluster_id_norm may "bake in" hard assignments |
+| Focal loss helps but limited | Focal helps with imbalance but can't fix wrong label formulation |
+
+### The Graph Learning Hypothesis
+
+We suspect the right approach is to **learn the graph structure itself** rather than classify edges on a fixed graph:
+
+| Current Approach (Edge Classification) | Proposed Approach (Graph Learning) |
+|----------------------------------------|-------------------------------------|
+| Fixed graph from geometric neighbors | Learn which cells should be connected |
+| Each edge has a single label (0-4) | Each edge has a weight/strength |
+| Hard assignment to one cluster | Soft assignment to multiple clusters |
+| Assumes clusters are disjoint | Allows overlapping clusters |
+| One prediction per edge | Learned adjacency matrix |
+
+**What success might look like:** Instead of predicting Class 1 (same cluster) vs Class 4 (different clusters), predict a continuous value: "probability these cells share energy"
+
+### Future Directions
+
+Based on our analysis, here are promising research directions:
+
+#### Direction 1: Soft Edge Prediction (Most Feasible)
+Instead of 5 classes, predict:
+- **Probability of sharing energy** (continuous from 0 to 1)
+- **Uncertainty quantification** per prediction
+- **Expected energy fraction** rather than hard label
+
+#### Direction 2: Graph Learning / Differentiable Graph Generation
+- Learn the adjacency matrix directly
+- Allow fractional edge weights
+- Use graph generation techniques (e.g., GraphVAE, EDGE, DiGress)
+
+#### Direction 3: Hypergraph or Multi-Graph Representations
+- One cell → multiple cluster memberships
+- Hypergraph where hyperedges represent clusters
+- Multi-layer graph (one layer per possible cluster)
+
+#### Direction 4: Energy Flow as Edge Weights
+- Use actual energy sharing information (if available from simulation)
+- Train on data with known fractional contributions
+- Predict energy fractions rather than hard labels
+
+### Practical Recommendations for Users of This Code
+
+If you're using CaloGraphNet and encountering similar limitations:
+
+1. **Don't trust accuracy** - A model with 95% accuracy might still have FSS < 3.0
+2. **Compute FSS after every experiment** - It's the only reliable metric
+3. **Use focal loss** - It consistently outperforms inverse weighting
+4. **Start with baseline features** - All-features mode may hurt more than help
+5. **SAGE seems best** - GraphSAGE with 8 layers and focal loss is our top performer
+6. **Check per-class F1** - If Classes 1 and 4 have low F1, you may have overlapping clusters
+
+### What 2.75 FSS Actually Means
+
+An FSS of 2.75 means:
+- On average, each class achieves F1 ≈ 0.55
+- Random guessing would be F1 ≈ 0.20 per class (FSS = 1.0)
+- Perfect would be F1 = 1.00 per class (FSS = 5.0)
+- We're about halfway between random and perfect
+
+**Class-specific performance from our best model (SAGE + focal):**
+
+| Class | Likely F1 | Interpretation |
+|-------|-----------|----------------|
+| Class 0 (Lone-Lone) | ~0.92 | Very good (easy class) |
+| Class 1 (Same Cluster) | ~0.45 | Poor - can't identify same-cluster pairs |
+| Class 2 (Source Only) | ~0.55 | Moderate |
+| Class 3 (Dest Only) | ~0.55 | Moderate |
+| Class 4 (Different Clusters) | ~0.28 | Very poor - can't separate different clusters |
+
+**The gap between Class 1 and Class 4 F1 is particularly telling:** The model can't distinguish "same cluster" from "different clusters" - which is exactly what you'd expect if clusters overlap!
+
+### Summary Table of What We've Tried
+
+| Approach | What We Did | Best Result | Lesson |
+|----------|-------------|-------------|--------|
+| **Metrics** | Accuracy → FSS | 2.75 FSS max | Accuracy is useless (92% trivial baseline) |
+| **Features** | Baseline (3) → All (42+) | Worse performance | More isn't better; feature engineering matters |
+| **Loss** | CrossEntropy → Focal | +0.5 FSS improvement | Focal helps with imbalance |
+| **Architecture** | GCN → SAGE → Transformer | SAGE best (2.75) | Differences are small (~0.5 FSS range) |
+| **Graph** | Fixed geometric neighbors | Stuck at 2.75 FSS | **Root cause: graph assumption fails** |
+
+### Open Questions for the Community
+
+We welcome input and collaboration on these questions:
+
+1. Has anyone successfully applied **soft edge prediction** (continuous labels) to calorimeter clustering?
+2. Are there public datasets with **fractional energy contributions** per cell per cluster?
+3. Could **graph generative models** (DiGress, GraphARM) learn overlapping cluster assignments?
+4. Is **hypergraph representation** more appropriate for overlapping particle showers?
+5. For those who've tried both: does **soft clustering** outperform hard classification on similar problems?
+
+### Conclusion
+
+CaloGraphNet successfully:
+- ✅ Builds graph datasets from ROOT files
+- ✅ Trains multiple GNN architectures (GCN, GAT, Transformer, SAGE)
+- ✅ Provides comprehensive analysis tools (ROC, PR curves, FSS, HTML reports)
+
+However, it has revealed a fundamental limitation: **edge classification on a fixed geometric graph may be insufficient for overlapping particle clusters.** The best model (SAGE + focal loss) achieves FSS 2.75 - far from perfect.
+
+We believe the path forward lies in:
+1. **Soft labels** (continuous energy fractions instead of hard cluster assignments)
+2. **Graph learning** (learn the graph structure, don't fix it)
+3. **Hypergraph representations** (capture multi-cell energy sharing)
+
+We hope this honest assessment helps others avoid similar pitfalls and inspires new approaches to this challenging problem.
