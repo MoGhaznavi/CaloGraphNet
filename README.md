@@ -9,15 +9,20 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 
 ## Table of Contents
+
+### Core Documentation
 - [Overview](#overview)
 - [Problem Statement](#problem-statement)
 - [Pipeline Architecture](#pipeline-architecture)
+
+### Data Processing
 - [File 1: build_graph_dataset.py](#file-1-build_graph_datasetpy)
   - [What it does](#what-it-does)
   - [The 4 Output Files](#the-4-output-files)
   - [Geometry Handling](#geometry-handling)
-  - [Label Logic](#label-logic)
   - [Usage](#usage-build_graph_datasetpy)
+
+### Model Training
 - [File 2: train_gnn_models.py](#file-2-train_gnn_modelspy)
   - [What it does](#what-it-does-1)
   - [Feature Sets](#feature-sets)
@@ -26,10 +31,43 @@
   - [Evaluation Metrics](#evaluation-metrics)
   - [Output Files](#output-files)
   - [Usage](#usage-train_gnn_modelspy)
+
+### Analysis & Visualization
+- [File 3: analyze_results.py](#file-3-analyze_resultspy)
+  - [What it does](#what-it-does-2)
+  - [Visualization Outputs](#visualization-outputs)
+  - [Understanding the Metrics](#understanding-the-metrics)
+  - [Complete Analysis Workflow](#complete-analysis-workflow)
+  - [Interpreting Results Quick Guide](#interpreting-results-quick-guide)
+
+### Getting Started
 - [Quick Start](#quick-start)
+  - [Installation](#installation)
+  - [Complete Example](#complete-example-from-root-to-analysis-report)
+  - [Expected Outputs](#expected-outputs)
+  - [Analyze Results with Python](#analyze-results-with-python)
+
+### Reference
 - [Configuration Reference](#configuration-reference)
-- [Citing This Work](#citing-this-work)
-- [License](#license)
+  - [build_graph_dataset.py Arguments](#build_graph_datasetpy-full-arguments)
+  - [train_gnn_models.py Arguments](#train_gnn_modelspy-full-arguments)
+
+### Lessons Learned & Future Directions
+- [Current Limitations & Lessons Learned](#current-limitations--lessons-learned)
+  - [The Challenge](#the-challenge-why-performance-isnt-where-we-want-it)
+  - [Our Best Results So Far](#our-best-results-so-far)
+  - [Lesson 1: Accuracy is Misleading](#lesson-1-accuracy-is-dangerously-misleading-for-imbalanced-data)
+  - [Lesson 2: Focal Loss Helps](#lesson-2-focal-loss-helps-but-doesnt-solve-the-core-issue)
+  - [Lesson 3: More Features Can Hurt](#lesson-3-more-features-dont-always-help-surprising-finding)
+  - [Lesson 4: Architecture Differences Are Small](#lesson-4-architecture-differences-are-smaller-than-expected)
+  - [The Core Issue: Graph Construction](#lesson-5-the-core-issue-may-be-graph-construction-itself)
+- [The Graph Learning Hypothesis](#the-graph-learning-hypothesis)
+- [Future Directions](#future-directions)
+- [Practical Recommendations](#practical-recommendations-for-users-of-this-code)
+- [What 2.75 FSS Actually Means](#what-275-fss-actually-means)
+- [Summary of Experiments](#summary-table-of-what-weve-tried)
+- [Open Questions](#open-questions-for-the-community)
+- [Conclusion](#conclusion)
 
 ---
 
