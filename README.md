@@ -443,7 +443,251 @@ python train_gnn_models.py \
 | `--patience` | 10 | Early stopping patience |
 
 ---
+Perfect! You should add the **File 3: analyze_results.py** section right after **File 2: train_gnn_models.py** and before **Quick Start**. Here's the expanded section with all the details:
 
+## Where to add in your README
+
+Insert this **after** the `train_gnn_models.py` section and **before** the `Quick Start` section:
+
+```
+## File 2: train_gnn_models.py
+... (your existing content) ...
+
+## File 3: analyze_results.py    <-- ADD THIS HERE
+
+## Quick Start
+... (your existing content) ...
+```
+
+---
+## File 3: analyze_results.py
+
+### What it does
+
+Generates comprehensive analysis and visualization for trained models. This script takes the model checkpoint files (`.pkl`) and prediction files (`.parquet`) from `train_gnn_models.py` and produces publication-ready figures and reports.
+
+**Visualization outputs:**
+
+| Plot Type | Description | What it shows |
+|-----------|-------------|----------------|
+| **ROC Curves** | Receiver Operating Characteristic curves | AUC per class, trade-off between TPR and FPR |
+| **Precision-Recall Curves** | PR curves with F1 iso-lines | AP score, best F1 point, class imbalance effects |
+| **Confusion Matrix** | Normalized confusion matrix | Per-class misclassification patterns |
+| **Per-Class Bar Chart** | Recall, Precision, F1 per class | Compare performance across 5 classes |
+| **Radar Chart** | Multi-metric comparison | Top models compared across 5 metrics |
+| **FSS vs RSS Scatter** | F1 Sum vs Recall Sum | Identify models with good precision (FSS > RSS) |
+| **Architecture Box Plot** | Performance by architecture | Compare GCN vs GAT vs Transformer vs SAGE |
+
+**Report outputs:**
+
+- **`master_report.html`** - Interactive HTML report with all results
+- **`comprehensive_metrics.csv`** - All metrics in CSV format
+- **`comprehensive_table.html`** - Styled table of top 10 models
+
+### Key Features
+
+- **Memory-efficient**: Processes parquet files in chunks (handles millions of edges)
+- **Primary metric**: F1 Sum Score (FSS) = Σ(F1 per class) - balances precision AND recall
+  - Perfect score = 5.0
+  - Random baseline = 1.0
+  - Accounts for False Positives (unlike RSS)
+- **Model ranking**: Automatically ranks models and identifies best performer by FSS
+- **Architecture comparison**: Compares GCN vs GAT vs Transformer vs SAGE
+- **Fallback handling**: If FSS not found, uses RSS with warning
+
+### Output Directory Structure
+
+After running, you'll get this organized output:
+
+```
+analysis_output/
+├── figures/
+│   ├── roc_curves/              # ROC + F1 tradeoff per model
+│   │   └── {model_name}_roc_f1.png
+│   ├── pr_curves/               # Precision-Recall curves
+│   │   └── {model_name}_pr_curves.png
+│   ├── confusion_matrices/      # Confusion matrices + per-class bars
+│   │   └── {model_name}_confusion_enhanced.png
+│   ├── comparison_plots/        # Cross-model comparisons
+│   │   └── comprehensive_metrics.png
+│   └── metrics_radar/           # Radar charts of top models
+│       └── metrics_radar.png
+├── tables/
+│   └── comprehensive_table.html  # Styled performance table
+├── reports/
+│   └── master_report.html        # Complete analysis report
+└── data/
+    └── comprehensive_metrics.csv  # All metrics in CSV format
+```
+
+### Understanding the Metrics
+
+| Metric | Abbrev | Range | What it penalizes | Best for |
+|--------|--------|-------|-------------------|----------|
+| **F1 Sum Score** | FSS | 1.0-5.0 | False Positives + False Negatives | **Primary metric** |
+| Recall Sum Score | RSS | 1.0-5.0 | False Negatives only | Legacy comparison |
+| Macro F1 | mF1 | 0-1 | Rare class mistakes | Balanced evaluation |
+| Weighted F1 | wF1 | 0-1 | Frequent class mistakes | Production deployment |
+| Mean Average Precision | mAP | 0-1 | Rank-order mistakes | Threshold tuning |
+
+**Why FSS is the primary metric:**
+- A model that predicts all edges as Class 0 (majority class) gets:
+  - High Accuracy (~90%) ❌ misleading
+  - High RSS (~4.5) ❌ misses the problem
+  - Low FSS (~1.2) ✅ reveals the issue
+- FSS penalizes models that sacrifice precision for recall
+
+### Usage
+
+**Basic usage:**
+```bash
+python analyze_results.py \
+    --models-dir /path/to/models \
+    --parquet-dir /path/to/parquet_files \
+    --output-dir ./analysis_output
+```
+
+**Advanced usage with custom limits:**
+```bash
+python analyze_results.py \
+    --models-dir /storage/foundation_experiments \
+    --parquet-dir /storage/foundation_experiments \
+    --output-dir ./comprehensive_analysis \
+    --max-rows-roc 1000000 \
+    --max-rows-confusion 2000000 \
+    --top-n 10 \
+    --batch-size 50000
+```
+
+**Key arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--models-dir` | Required | Directory containing `*_metrics.pkl` files |
+| `--parquet-dir` | Required | Directory containing `results_*.parquet` files |
+| `--output-dir` | `./analysis_output` | Output directory for all results |
+| `--max-rows-roc` | 500000 | Max rows for ROC/PR computation (memory control) |
+| `--max-rows-confusion` | 1000000 | Max rows for confusion matrix |
+| `--top-n` | 5 | Number of top models to show in radar chart |
+| `--batch-size` | 100000 | Batch size for parquet reading |
+
+### What Each Plot Tells You
+
+#### 1. ROC + F1 Tradeoff Plot
+- **Left panel**: ROC curves per class with AUC scores
+  - AUC > 0.9 = excellent discrimination
+  - Diagonal line = random guessing (AUC=0.5)
+- **Right panel**: F1 vs Recall scatter plot
+  - Bubble size = Precision (larger = better precision)
+  - Points above the diagonal = good precision-recall balance
+
+#### 2. Precision-Recall Curves
+- **Each class subplot**: PR curve with F1 iso-lines
+  - Dashed lines = constant F1 values (0.2, 0.4, 0.6, 0.8)
+  - Dot = point with best F1 score
+  - AP = Average Precision (area under PR curve)
+- **Summary plot**: All classes together for comparison
+- **Interpretation**: For imbalanced data, PR curves are more informative than ROC
+
+#### 3. Confusion Matrix + Per-Class Bars
+- **Left**: Normalized confusion matrix
+  - Diagonal = correct classifications (higher = better)
+  - Off-diagonal = common confusions
+- **Right**: Per-class Recall, Precision, F1 bar chart
+  - Classes 0 and 4 are typically hardest (noise vs different clusters)
+  - Classes 2 and 3 should be symmetric (source-only vs dest-only)
+
+#### 4. Comprehensive Comparison Plots
+- **Top-left**: FSS vs RSS bar chart
+  - If FSS < RSS significantly → model has poor precision
+  - Green bars (FSS) vs Blue bars (RSS)
+- **Top-right**: FSS vs RSS scatter
+  - Red points = FSS < RSS (precision problem)
+  - Blue points = FSS ≈ RSS (good balance)
+- **Bottom-left**: Per-class F1 scores (top 7 models)
+  - Shows which classes each model handles well
+- **Bottom-right**: Architecture comparison box plot
+  - Compares GCN, GAT, Transformer, SAGE performance
+
+#### 5. Radar Chart
+- Shows top N models across 5 metrics
+- Larger area = better overall performance
+- Different shapes reveal model strengths/weaknesses
+
+### Understanding the HTML Report
+
+The `master_report.html` provides:
+
+1. **Summary statistics** - Best model's FSS, Macro F1, Accuracy
+2. **Metric explanation** - Why FSS is primary
+3. **Interactive table** - Sortable, searchable model rankings
+4. **Embedded images** - All comparison plots
+5. **Class definitions** - What each label means
+
+Open it in any browser:
+```bash
+open analysis_output/reports/master_report.html  # macOS
+xdg-open analysis_output/reports/master_report.html  # Linux
+start analysis_output/reports/master_report.html  # Windows
+```
+
+### Complete Analysis Workflow
+
+Here's the full pipeline from training to analysis:
+
+```bash
+# Step 1: Train multiple models (optional: use --model all)
+python train_gnn_models.py --model gcn --baseline --gpu 0
+python train_gnn_models.py --model gat --baseline --gpu 0
+python train_gnn_models.py --model transformer --all-features --gpu 0
+
+# Step 2: Run inference on best checkpoints (if not done during training)
+python train_gnn_models.py --model gcn --baseline --inference-only
+python train_gnn_models.py --model gat --baseline --inference-only
+
+# Step 3: Analyze all results
+python analyze_results.py \
+    --models-dir /storage/foundation_experiments \
+    --parquet-dir /storage/foundation_experiments \
+    --output-dir ./final_analysis
+
+# Step 4: Open report
+open ./final_analysis/reports/master_report.html
+```
+
+### Interpreting Results: Quick Guide
+
+| If you see... | This means... | Action |
+|---------------|----------------|--------|
+| FSS > 4.0 | Excellent model | Deploy or use for physics analysis |
+| FSS < 2.5 | Poor performance | Try more features or different architecture |
+| FSS much lower than RSS | Precision problem | Use focal loss or class weights |
+| Class 0 F1 < 0.5 | Noise identification issues | Check noise statistics in data creation |
+| Class 4 F1 < 0.3 | Cluster separation failing | Add cluster-based features |
+| High accuracy but low FSS | Class imbalance masking issues | Trust FSS, not accuracy |
+| Transformer > GCN by >0.5 | Long-range dependencies matter | Use transformer with attention |
+| GAT > GCN by >0.3 | Graph structure is non-uniform | Attention helps - keep GAT |
+
+### Troubleshooting
+
+**"No parquet files found"**
+- Ensure you ran inference with `--inference-only` or training completed fully
+- Check that `--parquet-dir` points to directory with `results_*.parquet` files
+
+**"Memory error"**
+- Reduce `--max-rows-roc` and `--max-rows-confusion`
+- Reduce `--batch-size`
+- Use fewer models in the directory
+
+**"Missing metrics in pickle"**
+- The script falls back to RSS if FSS not found
+- Check that you're using the latest `train_gnn_models.py`
+
+**"Different number of models in PKL vs Parquet"**
+- Some models may have completed training but not inference
+- Run `--inference-only` for those models
+
+---
 ## Quick Start
 
 ### Installation
@@ -456,11 +700,11 @@ cd CaloGraphNet
 # Install dependencies
 pip install torch torch-geometric numpy awkward uproot h5py pandas pyarrow scikit-learn psutil
 
-# Optional: For progress bars in inference
-pip install tqdm
+# Optional: For progress bars and enhanced analysis
+pip install tqdm seaborn matplotlib
 ```
 
-### Complete Example: From ROOT to Trained Model
+### Complete Example: From ROOT to Analysis Report
 
 ```bash
 # Step 1: Build dataset from ROOT file
@@ -471,8 +715,12 @@ python build_graph_dataset.py \
     --normalize-energy
 
 # Output will be in: /my_data/physics_run/
+# - pairs_physics_run.npy (edges)
+# - cells_physics_run.npy (cell metadata)
+# - events_physics_run.h5 (features)
+# - labels_physics_run.npy (ground truth)
 
-# Step 2: Train a GCN model
+# Step 2: Train models (optional: use --model all for multiple architectures)
 python train_gnn_models.py \
     --model gcn \
     --baseline \
@@ -480,7 +728,7 @@ python train_gnn_models.py \
     --gpu 0 \
     --epochs 30
 
-# Step 3: (Optional) Run inference on best model
+# Step 3: Run inference on best model (saves parquet predictions)
 python train_gnn_models.py \
     --model gcn \
     --baseline \
@@ -488,42 +736,73 @@ python train_gnn_models.py \
     --data-dir /my_data/physics_run \
     --gpu 0
 
-# Results are in: /storage/mxg1065/foundation_experiments/
-# - best_gcn_baseline_h128_l6.pt (model)
-# - results_gcn_baseline_h128_l6.parquet (predictions)
+# Step 4: Generate comprehensive analysis report
+python analyze_results.py \
+    --models-dir /storage/foundation_experiments \
+    --parquet-dir /storage/foundation_experiments \
+    --output-dir ./analysis_results
+
+# Step 5: Open the interactive report
+open ./analysis_results/reports/master_report.html
 ```
 
-### Analyze Results with Pandas
+### Expected Outputs
+
+After running the full pipeline, you'll have:
+
+```
+/storage/foundation_experiments/
+├── best_gcn_baseline_h128_l6.pt          # Best model checkpoint
+├── gcn_baseline_h128_l6_metrics.pkl      # Training metrics
+├── results_gcn_baseline_h128_l6.parquet  # Predictions (230M edges)
+
+./analysis_results/
+├── figures/                               # All plots
+│   ├── roc_curves/                       # ROC per model
+│   ├── pr_curves/                        # PR per model
+│   ├── confusion_matrices/               # Confusion matrices
+│   ├── comparison_plots/                 # Cross-model comparisons
+│   └── metrics_radar/                    # Radar charts
+├── tables/
+│   └── comprehensive_table.html          # Sortable results table
+├── reports/
+│   └── master_report.html                # Complete analysis report
+└── data/
+    └── comprehensive_metrics.csv         # All metrics in CSV
+```
+
+### Analyze Results with Python
 
 ```python
 import pandas as pd
+import matplotlib.pyplot as plt
 
 # Load predictions
 df = pd.read_parquet("results_gcn_baseline_h128_l6.parquet")
 
-# Overall accuracy
-accuracy = (df['true_label'] == df['pred_label']).mean()
-print(f"Accuracy: {accuracy:.4f}")
-
-# Per-class F1 (requires grouping)
-def f1_per_class(df):
-    results = {}
+# Compute F1 Sum Score
+def f1_sum_score(df):
+    f1_scores = []
     for c in range(5):
         tp = ((df['true_label'] == c) & (df['pred_label'] == c)).sum()
         fp = ((df['true_label'] != c) & (df['pred_label'] == c)).sum()
         fn = ((df['true_label'] == c) & (df['pred_label'] != c)).sum()
+        
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        results[c] = {'precision': precision, 'recall': recall, 'f1': f1}
-    return results
+        f1_scores.append(f1)
+    
+    return sum(f1_scores)
 
-f1_scores = f1_per_class(df)
-print(f"F1 Sum Score: {sum(v['f1'] for v in f1_scores.values()):.2f}")
+print(f"F1 Sum Score: {f1_sum_score(df):.2f} (range: 1.0=random, 5.0=perfect)")
+
+# Load comprehensive metrics
+metrics_df = pd.read_csv("analysis_results/data/comprehensive_metrics.csv")
+print(f"Best model: {metrics_df.iloc[0]['name']} (FSS={metrics_df.iloc[0]['f1_sum_score']:.2f})")
 ```
 
 ---
-
 ## Configuration Reference
 
 ### build_graph_dataset.py Full Arguments
