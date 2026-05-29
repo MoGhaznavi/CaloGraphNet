@@ -218,8 +218,7 @@ python build_graph_dataset.py \
     --dataset-name my_dataset \
     --normalize-energy \
     --energy-normalization robust \
-    --chunk-size 50 \
-    --batch-size 20
+    --chunk-size 50 
 ```
 
 **Key arguments:**
@@ -232,7 +231,6 @@ python build_graph_dataset.py \
 | `--normalize-energy` | True | Apply energy normalization |
 | `--energy-normalization` | `robust` | `robust` (median/IQR) or `standard` |
 | `--skip-snr-scaling` | False | Don't scale SNR features |
-| `--batch-size` | 20 | Events per batch |
 | `--chunk-size` | 50 | Events per chunk (memory control) |
 | `--debug` | True | Enable debug output |
 
