@@ -15,6 +15,9 @@ import gc
 import glob
 import json
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "6")
+os.environ.setdefault("MKL_NUM_THREADS", "6")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "6")
 import pickle
 import psutil
 import re
@@ -120,6 +123,10 @@ class ResourceTracker:
         # Record initial GPU memory usage if CUDA is available.
         if torch.cuda.is_available():
             self.start_gpu_memory = torch.cuda.memory_allocated() / 1024**3
+            # ---- FIX: clear any peak-memory history from before start()
+            # was called, so the first measure() call's peak reflects only
+            # what happens after this point.
+            torch.cuda.reset_peak_memory_stats()
 
     def measure(self, stage: str) -> Optional[Dict]:
         """
@@ -148,13 +155,28 @@ class ResourceTracker:
             'memory_delta_gb': mem - self.start_memory,
         }
 
-        # Record GPU memory statistics if CUDA is being used.
+        # ---- FIX: report PEAK GPU usage since the last reset, not the
+        # instantaneous live-tensor count at this exact snapshot moment.
+        # memory_allocated() only counts tensors PyTorch's allocator
+        # currently considers live — between epochs, after batch tensors
+        # have gone out of scope, that number collapses toward zero even
+        # though the epoch just did heavy GPU work throughout. The peak
+        # counters (max_memory_allocated / max_memory_reserved) track the
+        # high-water mark since the last reset_peak_memory_stats() call,
+        # which is what you actually want to see here.
         if torch.cuda.is_available():
-            measurement['gpu_memory_gb'] = torch.cuda.memory_allocated() / 1024**3
+            measurement['gpu_memory_current_gb'] = torch.cuda.memory_allocated() / 1024**3
+            measurement['gpu_memory_peak_gb'] = torch.cuda.max_memory_allocated() / 1024**3
+            measurement['gpu_memory_reserved_peak_gb'] = torch.cuda.max_memory_reserved() / 1024**3
             measurement['gpu_memory_delta_gb'] = (
-                measurement['gpu_memory_gb'] - self.start_gpu_memory
+                measurement['gpu_memory_current_gb'] - self.start_gpu_memory
             )
             measurement['gpu_memory_type'] = 'cuda'
+
+            # Reset the peak counters so the NEXT measurement's peak
+            # reflects only the interval between this call and the next,
+            # rather than accumulating across the whole run.
+            torch.cuda.reset_peak_memory_stats()
 
         # Collect additional process statistics when available.
         try:
@@ -181,8 +203,9 @@ class ResourceTracker:
 
         if m:
             gpu_str = (
-                f" | GPU: {m['gpu_memory_gb']:.2f}GB"
-                if 'gpu_memory_gb' in m else ""
+                f" | GPU peak: {m['gpu_memory_peak_gb']:.2f}GB "
+                f"(reserved peak: {m['gpu_memory_reserved_peak_gb']:.2f}GB)"
+                if 'gpu_memory_peak_gb' in m else ""
             )
 
             log(
@@ -561,8 +584,12 @@ class CalorimeterMasking:
 # FEATURE LOADING
 # ============================================================================
 
-def load_features_with_selection(data_dir: str, args, tracker: Optional[ResourceTracker] = None) -> Tuple:
-    log(f"📊 Loading features: {'ALL FEATURES (42+)' if args.all_features else 'BASELINE (3 features)'}")
+def load_features_lazy(data_dir: str, args, tracker: Optional[ResourceTracker] = None) -> Tuple:
+    """
+    Lazy feature loading: returns HDF5 references instead of pre-loading all events.
+    Labels are memory-mapped for zero-copy access.
+    """
+    log(f"📊 Lazy feature loading: {'ALL FEATURES' if args.all_features else 'BASELINE (7 features)'}")
     log(f"📁 Data directory: {data_dir}")
     if tracker:
         tracker.log_measurement("start_loading")
@@ -586,200 +613,61 @@ def load_features_with_selection(data_dir: str, args, tracker: Optional[Resource
     total_size_gb = sum(os.path.getsize(f)/1024**3 for f in cells_files+pairs_files+event_files+label_files if os.path.exists(f))
     log(f"   Total: {total_size_gb:.2f} GB")
     
-    metadata = {}
-    if metadata_files:
-        with open(metadata_files[0], 'r') as f: metadata = json.load(f)
-    
-    cells = np.load(cells_files[0]); num_cells = cells.shape[0]
+    # Load static data (small, fits in RAM)
+    cells = np.load(cells_files[0])
+    num_cells = cells.shape[0]
     log(f"  ✓ Cells: {num_cells} ({cells.nbytes/1024**2:.1f} MB)")
-    pairs = np.load(pairs_files[0]).astype(np.int32); num_edges = pairs.shape[0]
+    
+    pairs = np.load(pairs_files[0]).astype(np.int32)
+    num_edges = pairs.shape[0]
     log(f"  ✓ Pairs: {num_edges} ({pairs.nbytes/1024**2:.1f} MB)")
     if tracker: tracker.log_measurement("static_files_loaded")
-    
+        
+    # Load labels into RAM (12 GB, manageable)
     log(f"\n📊 Loading labels...")
     label_chunks = [np.load(lf).astype(np.int8) for lf in label_files]
     labels = np.concatenate(label_chunks) if len(label_chunks) > 1 else label_chunks[0]
-    log(f"  ✓ Labels: {labels.shape} ({labels.nbytes/1024**2:.1f} MB)")
+    log(f"  ✓ Labels: {labels.shape} ({labels.nbytes/1024**2:.0f} MB)")
     del label_chunks; gc.collect()
-    if tracker: tracker.log_measurement("labels_loaded")
+    if tracker: tracker.log_measurement("labels_mapped")
     
-    num_events = metadata.get('total_events', labels.shape[0] if labels.ndim==2 else len(event_files)*1000)
-    
-    # Only load needed events
-    if getattr(args, 'inference_only', False):
-        load_start = int(num_events * args.train_ratio)
-        load_end = num_events
-        log(f"\n🔮 Inference-only: loading test events {load_start}-{load_end-1}")
-    else:
-        load_start = 0; load_end = num_events
-    
-    log(f"   Events to load: {load_end-load_start}")
-    log(f"\n📊 Loading event features...")
-    
-    features_dict = {}; cluster_info = {}; feature_names = []
     if args.baseline and not args.all_features:
         feature_names = ['snr_scaled', 'snr_gt4', 'snr_gt2', 'snr_gt0',
-                         'eta', 'sin_phi', 'cos_phi']; input_dim = 7
+                         'eta', 'sin_phi', 'cos_phi']
+        input_dim = 7
     else:
+        feature_names = []
         input_dim = 0
     
-    global_event_idx = 0; loaded_count = 0
-    static_fields = ['deta', 'dphi', 'volume', 'noise_mean', 'noise_std', 'noise_count', 'noise_category', 'num_neighbors']
+    # Build feature references instead of loading all data
+    feature_refs = []  # List of (hdf5_path, local_idx, has_eta, has_snr)
     
     for file_idx, event_file in enumerate(event_files):
-        file_start_time = time.perf_counter()
-        log(f"\n  📂 File {file_idx+1}/{len(event_files)}: {os.path.basename(event_file)}")
-        
         with h5py.File(event_file, 'r') as h5f:
-            if 'cell/snr_computed' in h5f: file_num_events = h5f['cell/snr_computed'].shape[0]
-            elif 'cell/energy_raw' in h5f: file_num_events = h5f['cell/energy_raw'].shape[0]
-            else: file_num_events = num_events//len(event_files) if len(event_files)>1 else num_events
-            
-            file_start_global = global_event_idx; file_end_global = global_event_idx + file_num_events
-            if file_end_global <= load_start or file_start_global >= load_end:
-                log(f"     ⏭️  Skipping (outside load range)")
-                global_event_idx += file_num_events; continue
-            
-            log(f"     Events: {file_num_events}")
-            
-            # Feature discovery on first non-skipped file
-            if args.all_features and not feature_names:
-                feature_names = []
-                for key in ['snr_computed', 'snr_raw', 'energy_raw', 'noise_raw', 'cell_eta', 'cell_phi']:
-                    h5_key = f'cell/{key}' if key in ['cell_eta', 'cell_phi'] else key
-                    if key in ['cell_eta', 'cell_phi']:
-                        if f'cell/{key}' in h5f: feature_names.append('eta' if key=='cell_eta' else 'phi')
-                    else:
-                        if key in h5f: feature_names.append(key)
-                if 'cell/cell_cluster_index' in h5f:
-                    feature_names.extend(['in_cluster', 'cluster_id_norm'])
-                for field in static_fields:
-                    if field in cells.dtype.names: feature_names.append(field)
-                if 'subcalo' in cells.dtype.names:
-                    for i in range(max(4, cells['subcalo'].max()+1)):
-                        feature_names.append(f'subcalo_{i}')
-                if 'sampling' in cells.dtype.names:
-                    for i in range(max(3, cells['sampling'].max()+1)):
-                        feature_names.append(f'sampling_{i}')
-                input_dim = len(feature_names)
-                log(f"\n     📋 Discovered {input_dim} features")
-            
-            # Pre-load full slices for all needed datasets
-            if args.baseline and not args.all_features:
-                # CORRECTED: Three-tier SNR fallback matching original logic
-                # snr_computed → snr_raw → energy/noise computation → zeros
-                if 'cell/snr_computed' in h5f:
-                    snr_full = h5f['cell/snr_computed'][:]
-                elif 'cell/snr_raw' in h5f:
-                    snr_full = h5f['cell/snr_raw'][:]
-                elif 'cell/energy_raw' in h5f:
-                    energy_full = h5f['cell/energy_raw'][:]
-                    noise_full = h5f['cell/noise_raw'][:]
-                    noise_full_safe = np.where(noise_full == 0, 1e-6, noise_full)
-                    snr_full = energy_full / noise_full_safe
-                else:
-                    snr_full = np.zeros((file_num_events, num_cells), dtype=np.float32)
-                
-                # eta/phi: bulk load from HDF5 or fall back to static cell arrays
-                if 'cell/cell_eta' in h5f:
-                    eta_full = h5f['cell/cell_eta'][:]
-                    phi_full = h5f['cell/cell_phi'][:]
-                else:
-                    # Store as 1D arrays to avoid materializing tiled (num_events, num_cells)
-                    eta_full = cells['eta_event0'].astype(np.float32)  # shape (num_cells,)
-                    phi_full = cells['phi_event0'].astype(np.float32)
+            if 'cell/snr_computed' in h5f:
+                file_num_events = h5f['cell/snr_computed'].shape[0]
+            elif 'cell/energy_raw' in h5f:
+                file_num_events = h5f['cell/energy_raw'].shape[0]
             else:
-                # All-features mode: bulk-load each HDF5 dataset
-                bulk_datasets = {}
-                for fname in feature_names:
-                    if fname in ['snr_computed', 'snr_raw', 'energy_raw', 'noise_raw'] and fname in h5f:
-                        bulk_datasets[fname] = h5f[fname][:]
-                    elif fname == 'eta' and 'cell/cell_eta' in h5f:
-                        bulk_datasets['eta'] = h5f['cell/cell_eta'][:]
-                    elif fname == 'sin_phi' and 'cell/cell_phi' in h5f:
-                        phi_val = bulk_datasets['phi'][local_idx]
-                        features_list.append(np.sin(phi_val).astype(np.float32))
-                    elif fname == 'cos_phi' and 'cell/cell_phi' in h5f:
-                        phi_val = bulk_datasets['phi'][local_idx]
-                        features_list.append(np.cos(phi_val).astype(np.float32))
-                    elif fname == 'in_cluster' and 'cell/cell_cluster_index' in h5f:
-                        bulk_datasets['cell_cluster_index'] = h5f['cell/cell_cluster_index'][:]
-                
-                # Pre-compute static cell features (same for all events)
-                static_features = []
-                for fname in feature_names:
-                    if fname in cells.dtype.names:
-                        static_features.append((fname, cells[fname].astype(np.float32)))
-                    elif fname.startswith('subcalo_'):
-                        i = int(fname.split('_')[1])
-                        static_features.append((fname, (cells['subcalo'].astype(np.int32) == i).astype(np.float32)))
-                    elif fname.startswith('sampling_'):
-                        i = int(fname.split('_')[1])
-                        static_features.append((fname, (cells['sampling'].astype(np.int32) == i).astype(np.float32)))
+                total_label_events = sum(arr.shape[0] for arr in labels)
+                file_num_events = total_label_events // len(event_files) if len(event_files) > 1 else total_label_events
             
-            # Now iterate events using pre-loaded slices
+            has_eta = 'cell/cell_eta' in h5f
+            has_snr = 'cell/snr_computed' in h5f or 'cell/snr_raw' in h5f or 'cell/energy_raw' in h5f
+            
             for local_idx in range(file_num_events):
-                event_idx = global_event_idx + local_idx
-                if event_idx < load_start or event_idx >= load_end: continue
-                loaded_count += 1
-                
-                if args.baseline and not args.all_features:
-                    # Handle both 2D (bulk loaded) and 1D (static fallback) arrays
-                    snr_row = snr_full[local_idx] if snr_full.ndim == 2 else snr_full
-                    eta_row = eta_full[local_idx] if eta_full.ndim == 2 else eta_full
-                    phi_row = phi_full[local_idx] if phi_full.ndim == 2 else phi_full
-                    
-                    # ---- BUGFIX #5: φ sin/cos encoding for periodicity ----
-                    sin_phi = np.sin(phi_row).astype(np.float32)
-                    cos_phi = np.cos(phi_row).astype(np.float32)
-                    
-                    # ---- BUGFIX #7: SNR scaling + threshold indicators ----
-                    snr_f32 = snr_row.astype(np.float32)
-                    snr_scaled = np.sign(snr_f32) * np.log1p(np.abs(snr_f32))
-                    snr_gt4 = (np.abs(snr_f32) > 4).astype(np.float32)
-                    snr_gt2 = (np.abs(snr_f32) > 2).astype(np.float32)
-                    snr_gt0 = (np.abs(snr_f32) > 0).astype(np.float32)
-                    
-                    features = np.stack([
-                        snr_scaled, snr_gt4, snr_gt2, snr_gt0,
-                        eta_row, sin_phi, cos_phi
-                    ], axis=1).astype(np.float32)
+                feature_refs.append({
+                    'hdf5_path': event_file,
+                    'local_idx': local_idx,
+                    'has_eta': has_eta,
+                    'has_snr': has_snr,
+                })
     
-                else:
-                    features_list = []
-                    for fname in feature_names:
-                        if fname in bulk_datasets:
-                            features_list.append(bulk_datasets[fname][local_idx])
-                        elif fname == 'in_cluster' and 'cell_cluster_index' in bulk_datasets:
-                            cidx = bulk_datasets['cell_cluster_index'][local_idx]
-                            features_list.append((cidx >= 0).astype(np.float32))
-                        elif fname == 'cluster_id_norm' and 'cell_cluster_index' in bulk_datasets:
-                            cidx = bulk_datasets['cell_cluster_index'][local_idx]
-                            features_list.append(cidx.astype(np.float32) / max(1, cidx.max()))
-                        else:
-                            # Static features from cells array
-                            for sf_name, sf_data in static_features:
-                                if sf_name == fname:
-                                    features_list.append(sf_data)
-                                    break
-                    
-                    if 'cell_cluster_index' in bulk_datasets:
-                        cluster_info[event_idx] = {
-                            'cell_cluster_index': bulk_datasets['cell_cluster_index'][local_idx].astype(np.int32)
-                        }
-                    features = np.stack(features_list, axis=1).astype(np.float32)
-                
-                features_dict[event_idx] = features
-                if args.debug and loaded_count >= 5: break
-            
-            global_event_idx += file_num_events
-            if args.debug and loaded_count >= 5: break
-        
-        log(f"     ✅ File processed in {time.perf_counter()-file_start_time:.1f}s ({loaded_count} loaded)")
-    
-    if tracker: tracker.log_measurement("features_loaded", f"{len(features_dict)} events, {input_dim} features")
-    log(f"\n✅ Loaded {len(features_dict)} events, {num_cells} cells, {num_edges} edges, {input_dim} features")
-    return features_dict, None, pairs, labels, cluster_info, input_dim, feature_names
+    if tracker:
+        tracker.log_measurement("feature_refs_built", f"{len(feature_refs)} events, {input_dim} features")
+    log(f"\n✅ Lazy references built: {len(feature_refs)} events, {num_cells} cells, {num_edges} edges, {input_dim} features")
+    log(f"   RAM usage: ~{cells.nbytes/1024**2:.0f} MB (cells) + ~{pairs.nbytes/1024**2:.0f} MB (pairs) + ~{labels.nbytes/1024**2:.0f} MB (labels)")
+    return feature_refs, pairs, labels, None, input_dim, feature_names, cells
 
 
 # ============================================================================
@@ -931,41 +819,56 @@ class GraphFoundationModel(nn.Module):
 
     def encode(self, x_list, edge_index_list, edge_attr_list=None):
         """
-        Encode node features into embeddings.
-        ...
+        Encode node features into embeddings — batched across graphs.
+    
+        Assumes every graph in the list shares the same node count and
+        edge topology (true here: same detector geometry every event),
+        so graphs are concatenated along the node dimension and edge
+        indices are offset accordingly, giving one large block-diagonal
+        graph the GPU can process in a single set of kernel calls.
         """
         weights = (
             torch.softmax(self.layer_weights, dim=0)
             if self.softmax else self.layer_weights
         ) if self.layer_weights_enabled else None
     
-        all_node_embeddings = []
-        
-        for idx, (x, proc_edges) in enumerate(zip(x_list, edge_index_list)):
-            x = x.to(self.device, non_blocking=True)
-            proc_edges = proc_edges.to(self.device, non_blocking=True)
-            
-            # Get edge features for this graph
-            edge_attr = None
-            if edge_attr_list is not None and idx < len(edge_attr_list):
-                if edge_attr_list[idx] is not None:
-                    edge_attr = edge_attr_list[idx].to(self.device, non_blocking=True)
+        num_graphs = len(x_list)
+        num_nodes = x_list[0].shape[0]
     
-            x_embed = self.node_embedding(x)
+        # Concatenate all node features into one big batch.
+        x_batch = torch.cat(
+            [x.to(self.device, non_blocking=True) for x in x_list], dim=0
+        )
     
-            for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-                # Pass edge_attr to convs that support it
-                if edge_attr is not None and self.model_type in ['gat', 'transformer']:
-                    h = torch.relu(bn(conv(x_embed, proc_edges, edge_attr)))
-                else:
-                    h = torch.relu(bn(conv(x_embed, proc_edges)))
-                if weights is not None:
-                    h = weights[i] * h
-                x_embed = x_embed + h
+        # Offset each graph's edge_index by its position in the batch.
+        edge_index_batch = torch.cat(
+            [
+                edge_index_list[i].to(self.device, non_blocking=True) + i * num_nodes
+                for i in range(num_graphs)
+            ],
+            dim=1
+        )
     
-            all_node_embeddings.append(x_embed)
-            
-        return all_node_embeddings
+        edge_attr_batch = None
+        if edge_attr_list is not None and edge_attr_list[0] is not None:
+            edge_attr_batch = torch.cat(
+                [e.to(self.device, non_blocking=True) for e in edge_attr_list], dim=0
+            )
+    
+        x_embed = self.node_embedding(x_batch)
+    
+        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+            if edge_attr_batch is not None and self.model_type in ['gat', 'transformer']:
+                h = torch.relu(bn(conv(x_embed, edge_index_batch, edge_attr_batch)))
+            else:
+                h = torch.relu(bn(conv(x_embed, edge_index_batch)))
+            if weights is not None:
+                h = weights[i] * h
+            x_embed = x_embed + h
+    
+        # Split back into a list of per-graph embeddings so `forward()`
+        # doesn't need to change at all.
+        return list(torch.split(x_embed, num_nodes, dim=0))
 
     def forward(self, x_list, edge_index_list, edge_index_out_list,
                 y_batch=None, mask=None, edge_attr_list=None):
@@ -1119,23 +1022,18 @@ class MaskedReconstructionLoss(nn.Module):
 # DATA GENERATOR
 # ============================================================================
 
-# Add this at the top of the file with other torch_geometric imports:
-from torch_geometric.utils import to_undirected
-
-
 class MultiClassBatchGenerator(IterableDataset):
     """
     Iterable dataset that streams graph samples in chunks to reduce memory
     usage while supporting efficient GPU training.
+    
+    Now supports lazy loading: features are loaded on-demand from HDF5.
     """
-
-    def __init__(self, features_dict, neighbor_pairs, labels,
-                 mode="train", is_bi_directional=True,
+    def __init__(self, feature_refs, neighbor_pairs, labels,
+                 cells_array, mode="train", is_bi_directional=True,
                  batch_size=1, train_ratio=0.7, debug=False,
-                 unscaled_data_dict=None, cluster_info_dict=None,
-                 chunk_size=2000, inference_only=False,
-                 cells_array=None):
-
+                 cluster_info_dict=None, chunk_size=2000, inference_only=False):
+    
         # Store dataset configuration.
         self.debug = debug
         self.batch_size = batch_size
@@ -1144,84 +1042,86 @@ class MultiClassBatchGenerator(IterableDataset):
         self.chunk_size = chunk_size
         self.inference_only = inference_only
         self.is_bi_directional = is_bi_directional
-        self._cells_array = cells_array  # ← Store for edge feature computation
-
-        # Store references to the underlying data.
-        self._features_dict = features_dict
-        self._unscaled_dict = unscaled_data_dict
-        self._labels = labels
+        self._cells_array = cells_array
+    
+        # Store references (lazy: features not loaded yet)
+        self._feature_refs = feature_refs  # List of dicts with HDF5 references
+        self._labels = labels  # Memory-mapped array
         self._cluster_info_dict = cluster_info_dict
-
+    
         # Convert neighbor pairs to a PyTorch tensor.
         self.neighbor_pairs = torch.as_tensor(
             neighbor_pairs, dtype=torch.long
         )
-
+    
         # ---- BUGFIX: Proper bidirectional edge handling ----
-        # Convert from (E, 2) to (2, E) format expected by PyG convs
         raw_edges = self.neighbor_pairs.T.contiguous()
-
+    
         if self.is_bi_directional:
-            # Create undirected edges for message passing by adding reverse edges.
-            # Example: (0→1, 1→2) becomes (0→1, 1→0, 1→2, 2→1)
             self.pairs_mp = to_undirected(raw_edges)
-            # Keep original directional edges for prediction so labels
-            # still align 1:1 with the edges being classified.
             self.pairs_pred = raw_edges
         else:
             self.pairs_mp = raw_edges
             self.pairs_pred = raw_edges
-
+    
+        # ---- SANITY CHECK: edge_attr (built in _compute_edge_features_from_array
+        # as exactly 2 * pairs_pred.shape[1] rows) must line up with pairs_mp's
+        # edge count, since GAT/Transformer pass both into the same conv call.
+        # to_undirected() can deduplicate edges, which would silently break that
+        # assumption on some datasets — fail fast at startup instead of mid-training.
+        if self.is_bi_directional:
+            expected_mp_edges = 2 * self.pairs_pred.shape[1]
+            actual_mp_edges = self.pairs_mp.shape[1]
+            if actual_mp_edges != expected_mp_edges:
+                raise ValueError(
+                    f"Edge count mismatch: pairs_mp has {actual_mp_edges} edges "
+                    f"but edge_attr will be built with {expected_mp_edges} rows "
+                    f"(2 * {self.pairs_pred.shape[1]} pairs_pred edges). "
+                    f"to_undirected() likely deduplicated repeated pairs in "
+                    f"neighbor_pairs. GAT/Transformer models will fail or "
+                    f"silently misalign edge features until this is resolved "
+                    f"(e.g. dedupe neighbor_pairs upstream, or drop edge_attr's "
+                    f"reversed-copy construction to match to_undirected's output)."
+                )
+    
         # Pin memory to speed up CPU → GPU transfers.
         if torch.cuda.is_available():
             self.pairs_mp = self.pairs_mp.pin_memory()
             self.pairs_pred = self.pairs_pred.pin_memory()
-
-        # Split events into training and validation/test sets using the
-        # actual event IDs instead of assuming consecutive numbering.
-        all_event_ids = sorted(self._features_dict.keys())
-        self.num_events = len(all_event_ids)
-
+    
+        # Split events into training and validation/test sets.
+        self.num_events = len(feature_refs)
+        all_event_ids = list(range(self.num_events))
         split_idx = int(self.num_events * train_ratio)
-
+    
         if mode == "train":
             self.event_indices = all_event_ids[:split_idx]
         else:
             self.event_indices = all_event_ids[split_idx:]
-
+    
         pin_msg = " [pinned]" if torch.cuda.is_available() else ""
-
+    
         log(
             f"📊 {mode.upper()} SET: {len(self.event_indices)} events "
             f"[CUDA, chunk={chunk_size}, bidirectional={is_bi_directional}{pin_msg}]"
         )
-
-        # Number of chunks required to process the dataset.
+    
         self.num_chunks = (
             len(self.event_indices) + chunk_size - 1
         ) // chunk_size
-
-        # Storage for the currently loaded chunk.
+    
         self._chunk_data = []
 
-    def _compute_edge_features(self, event_idx):
+    def _compute_edge_features_from_array(self, features_np):
+        """Same as before but takes numpy array directly instead of looking up in dict."""
         if self._cells_array is None:
             return None
         
-        features = self._features_dict[event_idx]
-        if isinstance(features, torch.Tensor):
-            features_np = features.numpy()
-        else:
-            features_np = features
+        sin_phi = features_np[:, 5]
+        cos_phi = features_np[:, 6]
+        eta = features_np[:, 4]
         
-        sin_phi = features_np[:, 5]   # was 2, now 5 in [snr_scaled, snr_gt4, snr_gt2, snr_gt0, eta, sin_phi, cos_phi]
-        cos_phi = features_np[:, 6]   # was 3, now 6
-        eta = features_np[:, 4]       # was 1, now 4
-        
-        # Use pairs_pred (original directional edges) for feature computation
-        # pairs_pred shape: (2, E) — we need to match this edge count
         num_edges = self.pairs_pred.shape[1]
-        
         src = self.pairs_pred[0, :num_edges].numpy()
         dst = self.pairs_pred[1, :num_edges].numpy()
         
@@ -1239,149 +1139,167 @@ class MultiClassBatchGenerator(IterableDataset):
             same_layer = np.ones(num_edges, dtype=np.float32)
         
         edge_attr = np.stack([
-            deta.astype(np.float32),
-            dphi_sin.astype(np.float32),
-            dphi_cos.astype(np.float32),
-            dr.astype(np.float32),
-            same_layer
+            deta.astype(np.float32), dphi_sin.astype(np.float32),
+            dphi_cos.astype(np.float32), dr.astype(np.float32), same_layer
         ], axis=1)
         
-        # If bidirectional, we need to expand edge features to match pairs_mp
-        # pairs_mp has original edges + reverse edges interleaved
         if self.is_bi_directional:
-            # For reverse edges, negate deta, flip sin/cos of dphi
             edge_attr_rev = edge_attr.copy()
-            edge_attr_rev[:, 0] = -edge_attr_rev[:, 0]       # negate Δη
-            edge_attr_rev[:, 1] = -edge_attr_rev[:, 1]       # sin(-Δφ) = -sin(Δφ)
-            # edge_attr_rev[:, 2] stays same (cos(-Δφ) = cos(Δφ))
-            # edge_attr_rev[:, 3] stays same (ΔR same for reverse)
-            # edge_attr_rev[:, 4] stays same (same_layer flag symmetric)
-            
-            # Interleave: original then reverse for each edge
-            # pairs_mp is [orig_0, rev_0, orig_1, rev_1, ...] (depends on to_undirected ordering)
-            # to_undirected in PyG does: [all_original, all_reverse]
-            # So we concatenate
+            edge_attr_rev[:, 0] = -edge_attr_rev[:, 0]
+            edge_attr_rev[:, 1] = -edge_attr_rev[:, 1]
             edge_attr_full = np.concatenate([edge_attr, edge_attr_rev], axis=0)
         else:
             edge_attr_full = edge_attr
         
         return torch.from_numpy(edge_attr_full)
-
-    def _load_chunk(self, chunk_idx):
+        
+    def _load_event_features_from_open(self, ref, h5f):
         """
-        Load a single chunk of events into memory.
+        Load a single event's features from an already-open HDF5 file.
+        Avoids the overhead of opening/closing for every event.
         """
-        start = chunk_idx * self.chunk_size
-        end = min(start + self.chunk_size, len(self.event_indices))
+        local_idx = ref['local_idx']
+        
+        # Load SNR
+        if 'cell/snr_computed' in h5f:
+            snr_row = h5f['cell/snr_computed'][local_idx]
+        elif 'cell/snr_raw' in h5f:
+            snr_row = h5f['cell/snr_raw'][local_idx]
+        elif 'cell/energy_raw' in h5f:
+            energy = h5f['cell/energy_raw'][local_idx]
+            noise = h5f['cell/noise_raw'][local_idx]
+            noise_safe = np.where(noise == 0, 1e-6, noise)
+            snr_row = energy / noise_safe
+        else:
+            snr_row = np.zeros(self._cells_array.shape[0], dtype=np.float32)
+        
+        # Load eta, phi
+        if ref['has_eta']:
+            eta_row = h5f['cell/cell_eta'][local_idx]
+            phi_row = h5f['cell/cell_phi'][local_idx]
+        else:
+            eta_row = self._cells_array['eta_event0'].astype(np.float32)
+            phi_row = self._cells_array['phi_event0'].astype(np.float32)
+        
+        # Apply feature engineering
+        sin_phi = np.sin(phi_row).astype(np.float32)
+        cos_phi = np.cos(phi_row).astype(np.float32)
+        
+        snr_f32 = snr_row.astype(np.float32)
+        snr_scaled = np.sign(snr_f32) * np.log1p(np.abs(snr_f32))
+        snr_gt4 = (np.abs(snr_f32) > 4).astype(np.float32)
+        snr_gt2 = (np.abs(snr_f32) > 2).astype(np.float32)
+        snr_gt0 = (np.abs(snr_f32) > 0).astype(np.float32)
+        
+        features = np.stack([
+            snr_scaled, snr_gt4, snr_gt2, snr_gt0,
+            eta_row, sin_phi, cos_phi
+        ], axis=1).astype(np.float32)
+        
+        return features
 
-        chunk_events = self.event_indices[start:end]
-
-        # Periodically report loading progress.
-        if (
-            self.debug
-            or self.num_chunks <= 1
-            or chunk_idx % max(1, self.num_chunks // 5) == 0
-        ):
+    def _load_chunk_from_events(self, chunk_events, chunk_idx, num_chunks):
+        """
+        Load a chunk given an explicit list of event indices (so it works
+        whether that list is the full split or a per-worker shard of it).
+        """
+        if self.debug or num_chunks <= 1 or chunk_idx % max(1, num_chunks // 5) == 0:
             log(
-                f"  📂 Chunk {chunk_idx+1}/{self.num_chunks}: "
+                f"  📂 Chunk {chunk_idx+1}/{num_chunks}: "
                 f"events {chunk_events[0]}-{chunk_events[-1]} "
                 f"({len(chunk_events)})"
             )
-
+    
         chunk_samples = []
-
-        # Construct one graph sample for each event.
+        current_hdf5_path = None
+        current_h5f = None
+    
         for event_idx in chunk_events:
-
-            # Skip missing events.
-            if event_idx not in self._features_dict:
+            if event_idx >= len(self._feature_refs):
                 continue
-
-            # Load node features.
-            x_scaled = torch.as_tensor(
-                self._features_dict[event_idx],
-                dtype=torch.float32
-            )
-
-            # Pin feature memory for faster GPU transfers.
-            if torch.cuda.is_available():
-                x_scaled = x_scaled.pin_memory()
-
-            # Load edge labels.
-            out_labels = torch.as_tensor(
-                self._labels[event_idx],
-                dtype=torch.long
-            )
+    
+            ref = self._feature_refs[event_idx]
+    
+            if ref['hdf5_path'] != current_hdf5_path:
+                if current_h5f is not None:
+                    current_h5f.close()
+                current_hdf5_path = ref['hdf5_path']
+                current_h5f = h5py.File(current_hdf5_path, 'r')
+    
+            features = self._load_event_features_from_open(ref, current_h5f)
+            edge_attr = self._compute_edge_features_from_array(features)
+    
+            x_scaled = torch.as_tensor(features, dtype=torch.float32)
+            del features
+    
+            out_labels = torch.as_tensor(self._labels[event_idx].copy(), dtype=torch.long)
             if out_labels.dim() == 1:
                 out_labels = out_labels.unsqueeze(1)
-
-            if torch.cuda.is_available():
-                out_labels = out_labels.pin_memory()
-
-            # Optional per-cluster metadata.
+    
             cluster_info = (
                 self._cluster_info_dict.get(event_idx)
                 if self._cluster_info_dict
                 else None
             )
-
-            # ---- BUGFIX #6: Compute edge features ----
-            edge_attr = self._compute_edge_features(event_idx)
-            if edge_attr is not None and torch.cuda.is_available():
-                edge_attr = edge_attr.pin_memory()
-            
+    
             chunk_samples.append((
-                x_scaled,
-                self.pairs_mp,      # ← Bidirectional for message passing
-                self.pairs_pred,    # ← Original directional for prediction
-                out_labels,
-                edge_attr,          # ← NEW: edge features (was None)
-                cluster_info,
-                event_idx
+                x_scaled, self.pairs_mp, self.pairs_pred,
+                out_labels, edge_attr, cluster_info, event_idx
             ))
-
+    
+        if current_h5f is not None:
+            current_h5f.close()
+    
+        gc.collect()
         return chunk_samples
-
+        
     def _free_chunk(self):
         """
         Release the currently loaded chunk to keep memory usage low.
         """
         if self._chunk_data:
+            for sample in self._chunk_data:
+                del sample
             del self._chunk_data
             self._chunk_data = []
             gc.collect()
-
-        # Clear any cached GPU allocations.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def __iter__(self):
         """
         Iterate over the dataset one chunk at a time.
+        Shards event_indices across DataLoader workers when num_workers > 0.
         """
-        for chunk_idx in range(self.num_chunks):
-
-            # Free the previous chunk before loading the next one.
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Give each worker a disjoint slice of the events.
+            per_worker = int(np.ceil(len(self.event_indices) / worker_info.num_workers))
+            w_start = worker_info.id * per_worker
+            w_end = min(w_start + per_worker, len(self.event_indices))
+            local_event_indices = self.event_indices[w_start:w_end]
+        else:
+            local_event_indices = self.event_indices
+    
+        local_num_chunks = (len(local_event_indices) + self.chunk_size - 1) // self.chunk_size
+    
+        for chunk_idx in range(local_num_chunks):
             self._free_chunk()
-
-            self._chunk_data = self._load_chunk(chunk_idx)
-
-            # Yield each graph sample individually.
+    
+            start = chunk_idx * self.chunk_size
+            end = min(start + self.chunk_size, len(local_event_indices))
+            chunk_events = local_event_indices[start:end]
+    
+            self._chunk_data = self._load_chunk_from_events(chunk_events, chunk_idx, local_num_chunks)
+    
             for sample in self._chunk_data:
                 yield sample
-
-                # In debug mode, only process a few samples.
-                if (
-                    self.debug
-                    and chunk_idx == 0
-                    and len(self._chunk_data[:5]) >= 5
-                ):
+                if self.debug and chunk_idx == 0 and len(self._chunk_data[:5]) >= 5:
                     break
-
-            # Only process the first chunk when debugging.
+    
             if self.debug:
                 break
-
+    
         self._free_chunk()
 
     def __len__(self):
@@ -1452,11 +1370,18 @@ def pretrain_epoch(model, loader, optimizer, criterion, masking_fn,
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
             predictions = model(masked_x_list, ei_list, eio_list, edge_attr_list=edge_attr_list)
             
-            # Compute reconstruction loss
+            # ---- BUGFIX: predictions is one concatenated tensor covering
+            # every graph in the batch (model.encode() batches them together).
+            # Split it back per-graph by node count so the loss actually sees
+            # every sample, instead of zip()'s previous silent truncation to
+            # just the first graph in the batch.
+            node_counts = [t.shape[0] for t in targets_list]
+            pred_list = list(torch.split(predictions, node_counts, dim=0))
+            
             loss = 0
-            for pred, target, mask in zip([predictions], targets_list, mask_list):
+            for pred, target, mask in zip(pred_list, targets_list, mask_list):
                 loss += criterion(pred, target, mask)
-            loss /= len(masked_x_list)
+            loss /= len(pred_list)
         
         # Backward pass with mixed precision
         if scaler:
@@ -2237,7 +2162,7 @@ def train_model_full(model, train_loader, test_loader, test_generator, optimizer
 
 def train_single_model(args, model_type=None, tracker=None):
     model_name_used = model_type or args.model
-    
+
     if args.gpu >= 0 and torch.cuda.is_available():
         device = torch.device(f"cuda:{args.gpu}"); torch.cuda.set_device(args.gpu)
         log(f"🎯 GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
@@ -2245,13 +2170,7 @@ def train_single_model(args, model_type=None, tracker=None):
         device = torch.device("cpu"); log("🎯 CPU")
     if tracker: tracker.log_measurement("device_set")
     
-    features_dict, _, pairs, labels, cluster_info, input_dim, feature_names = load_features_with_selection(args.data_dir, args, tracker)
-    
-    # Load cells array for geometry masking
-    cells = None
-    cells_files = sorted(glob.glob(os.path.join(args.data_dir, "cells_*.npy")))
-    if cells_files:
-        cells = np.load(cells_files[0])
+    feature_refs, pairs, labels, cluster_info, input_dim, feature_names, cells = load_features_lazy(args.data_dir, args, tracker)
     
     exp_name = args.exp_name or f"{model_name_used}_{'baseline' if not args.all_features else 'all'}_h{args.hidden_dim}_l{args.layers}"
     if model_name_used in ['gat','transformer']: exp_name += f"_heads{args.heads}"
@@ -2294,13 +2213,13 @@ def train_single_model(args, model_type=None, tracker=None):
         model_base = os.path.splitext(model_filename)[0]
         parquet_path = os.path.join(args.save_dir, f"results_{model_base}.parquet")
         
-        gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
-                      'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
-                      'debug': args.debug, 'is_bi_directional': True,
-                      'train_ratio': 0.0,  # all events go to test
-                      'chunk_size': 2000, 'inference_only': True,
-                      'cells_array': cells}  # ← BUGFIX #6
-        test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
+        test_generator = MultiClassBatchGenerator(
+            feature_refs, pairs, labels, cells, mode='test',
+            cluster_info_dict=cluster_info,
+            debug=args.debug, is_bi_directional=True,
+            train_ratio=args.train_ratio,
+            chunk_size=2000, inference_only=False
+        )
         
         _, test_metrics = run_inference(
             model, test_generator, device,
@@ -2370,26 +2289,67 @@ def train_single_model(args, model_type=None, tracker=None):
         pretrain_optimizer = optim.Adam(pretrain_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         pretrain_scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
         log(f"✅ Pretraining: {'FP16' if pretrain_scaler else 'FP32'}")
-        
-        # Create data generators for pretraining (use all data, no labels needed)
-        gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
-                      'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
-                      'debug': args.debug, 'is_bi_directional': True, 
-                      'train_ratio': 1.0,  # Use all data for pretraining
-                      'chunk_size': 2000, 'inference_only': False,
-                      'cells_array': cells}  # ← BUGFIX #6
-        pretrain_generator = MultiClassBatchGenerator(mode='train', **gen_kwargs)
-        
+
+        # ---- RESTORED: dataset/loader creation for pretraining ----
+        pretrain_generator = MultiClassBatchGenerator(
+            feature_refs, pairs, labels, cells,
+            mode='train',
+            cluster_info_dict=cluster_info,
+            debug=args.debug, is_bi_directional=True,
+            train_ratio=1.0,  # Use all data for pretraining
+            chunk_size=2000, inference_only=False
+        )
+
         pretrain_loader = DataLoader(pretrain_generator, batch_size=args.batch_size,
                                     collate_fn=MultiClassBatchGenerator.collate_data, 
                                     pin_memory=True, num_workers=0)
-        
-        # Pretraining loop
-        log(f"\n🚀 Starting pretraining for {args.pretrain_epochs} epochs...")
+
+        pretrained_path = os.path.join(args.save_dir, f"pretrained_{model_filename}")
+        pretrain_metrics_path = os.path.join(args.save_dir, f"pretrain_metrics_{exp_name}.pkl")
+
+        # ---- RESUME SUPPORT ----
+        # Unlike train_model_full(), pretraining previously had no resume
+        # logic: every restart began at epoch 1 with best_pretrain_loss
+        # reset to inf, silently overwriting any existing checkpoint on the
+        # very first epoch. This mirrors the checkpoint/resume pattern
+        # already used for finetuning.
+        start_pretrain_epoch = 1
         best_pretrain_loss = float('inf')
         pretrain_metrics_history = []
-        
-        for epoch in range(1, args.pretrain_epochs + 1):
+
+        if args.resume and os.path.exists(pretrained_path):
+            ckpt = torch.load(pretrained_path, map_location=device, weights_only=True)
+            pretrain_model.load_state_dict(ckpt['model_state_dict'])
+            pretrain_optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if pretrain_scaler and 'scaler_state_dict' in ckpt:
+                pretrain_scaler.load_state_dict(ckpt['scaler_state_dict'])
+
+            start_pretrain_epoch = ckpt.get('epoch', 0) + 1
+            best_pretrain_loss = ckpt.get('pretrain_loss', float('inf'))
+
+            log(
+                f"[Resume] Loaded pretrained checkpoint: {pretrained_path} "
+                f"(epoch {ckpt.get('epoch', '?')}, loss={best_pretrain_loss:.6f})"
+            )
+
+            if os.path.exists(pretrain_metrics_path):
+                try:
+                    pretrain_metrics_history = load_pickle(pretrain_metrics_path)
+                    log(f"[Resume] Loaded {len(pretrain_metrics_history)} prior pretrain epoch records")
+                except Exception as e:
+                    log(f"⚠️ Could not load pretrain metrics history, starting fresh: {e}")
+                    pretrain_metrics_history = []
+
+            if start_pretrain_epoch > args.pretrain_epochs:
+                log(
+                    f"✅ Pretraining already complete "
+                    f"({start_pretrain_epoch - 1}/{args.pretrain_epochs} epochs done) — skipping ahead"
+                )
+
+        # Pretraining loop
+        log(f"\n🚀 Starting pretraining from epoch {start_pretrain_epoch} to {args.pretrain_epochs}...")
+
+        for epoch in range(start_pretrain_epoch, args.pretrain_epochs + 1):
             t0 = time.perf_counter()
             
             pretrain_res = pretrain_epoch(
@@ -2409,11 +2369,11 @@ def train_single_model(args, model_type=None, tracker=None):
             # Save best pretrained model
             if pretrain_res['loss'] < best_pretrain_loss:
                 best_pretrain_loss = pretrain_res['loss']
-                pretrained_path = os.path.join(args.save_dir, f"pretrained_{model_filename}")
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': pretrain_model.state_dict(),
                     'optimizer_state_dict': pretrain_optimizer.state_dict(),
+                    **({'scaler_state_dict': pretrain_scaler.state_dict()} if pretrain_scaler else {}),
                     'feature_names': feature_names,
                     'input_dim': input_dim,
                     'hidden_dim': args.hidden_dim,
@@ -2430,7 +2390,9 @@ def train_single_model(args, model_type=None, tracker=None):
                                        f"Loss={pretrain_res['loss']:.4f}")
         
         # Save pretraining metrics
-        pretrain_metrics_path = os.path.join(args.save_dir, f"pretrain_metrics_{exp_name}.pkl")
+        # ---- CLEANUP: pretrain_metrics_path was previously recomputed
+        # here a second time (identical value, just redundant). It's
+        # already set above where it's needed for the resume-loading step.
         save_pickle(pretrain_metrics_history, pretrain_metrics_path)
         log(f"💾 Pretraining complete! Best loss: {best_pretrain_loss:.6f}")
         
@@ -2479,7 +2441,7 @@ def train_single_model(args, model_type=None, tracker=None):
         
     else:
         # ---- NORMAL TRAINING MODE (NO PRETRAINING) ----
-        criterion = create_loss_function(args, labels, device)
+        # Use training labels for class weight computation
         model = GraphFoundationModel(input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
                                      args.heads, args.dropout, args.layer_weights, args.softmax_weights, 
                                      args.norm, args.debug, pretraining=False, feature_names=feature_names).to(device)
@@ -2488,7 +2450,7 @@ def train_single_model(args, model_type=None, tracker=None):
     
     # ---- COMMON TRAINING SETUP ----
     # Reuse the generator's event list
-    all_event_ids = sorted(features_dict.keys())
+    all_event_ids = list(range(len(feature_refs)))
     split_idx = int(len(all_event_ids) * args.train_ratio)
     
     # Extract only training labels to avoid data leakage
@@ -2506,18 +2468,35 @@ def train_single_model(args, model_type=None, tracker=None):
     
     scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and args.gpu>=0 and torch.cuda.is_available()) else None
     log(f"✅ {'FP16' if scaler else 'FP32'} | LR: cosine+{warmup_epochs}ep warmup")
-    gen_kwargs = {'features_dict': features_dict, 'neighbor_pairs': pairs, 'labels': labels,
-                  'unscaled_data_dict': None, 'cluster_info_dict': cluster_info,
-                  'debug': args.debug, 'is_bi_directional': True, 'train_ratio': args.train_ratio,
-                  'chunk_size': 2000, 'inference_only': False,
-                  'cells_array': cells}  # ← BUGFIX #6
-    train_generator = MultiClassBatchGenerator(mode='train', **gen_kwargs)
-    test_generator = MultiClassBatchGenerator(mode='test', **gen_kwargs)
     
-    train_loader = DataLoader(train_generator, batch_size=args.batch_size,
-                              collate_fn=MultiClassBatchGenerator.collate_data, pin_memory=True, num_workers=0)
-    test_loader = DataLoader(test_generator, batch_size=args.batch_size,
-                             collate_fn=MultiClassBatchGenerator.collate_data, pin_memory=True, num_workers=0)
+    train_generator = MultiClassBatchGenerator(
+        feature_refs, pairs, labels, cells,
+        mode='train',
+        cluster_info_dict=cluster_info,
+        debug=args.debug, is_bi_directional=True,
+        train_ratio=args.train_ratio,
+        chunk_size=2000, inference_only=False
+    )
+    test_generator = MultiClassBatchGenerator(
+        feature_refs, pairs, labels, cells,
+        mode='test',
+        cluster_info_dict=cluster_info,
+        debug=args.debug, is_bi_directional=True,
+        train_ratio=args.train_ratio,
+        chunk_size=2000, inference_only=False
+    )
+    train_loader = DataLoader(
+        train_generator, batch_size=args.batch_size,
+        collate_fn=MultiClassBatchGenerator.collate_data,
+        pin_memory=True, num_workers=4, persistent_workers=True,
+        prefetch_factor=2
+    )
+    test_loader = DataLoader(
+        test_generator, batch_size=args.batch_size,
+        collate_fn=MultiClassBatchGenerator.collate_data,
+        pin_memory=True, num_workers=2, persistent_workers=True,
+        prefetch_factor=2
+    )
     if tracker: tracker.log_measurement("data_loaders_ready")
     
     metrics, model, model_path = train_model_full(model, train_loader, test_loader, test_generator,
