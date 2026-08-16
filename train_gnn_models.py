@@ -448,62 +448,60 @@ class CalorimeterMasking:
     def _get_geometry_mask(self, num_cells: int, cell_positions: np.ndarray,
                           rng: np.random.RandomState) -> np.ndarray:
         """Geometry masking - mask cells in a contiguous spatial region."""
-        mask = np.zeros(num_cells, dtype=bool)
-        
-        # Choose a random seed cell
         seed_cell = rng.randint(0, num_cells)
         seed_eta = cell_positions[seed_cell, 0]
         seed_phi = cell_positions[seed_cell, 1]
-        
-        # Mask cells within a certain eta-phi window
-        # Note: phi wrapping not handled here for simplicity
-        # In practice, you'd want proper angular distance
-        eta_window = 0.3 * self.geometry_radius  # Adjust window size
+    
+        eta_window = 0.3 * self.geometry_radius
         phi_window = 0.3 * self.geometry_radius
-        
-        for i in range(num_cells):
-            deta = abs(cell_positions[i, 0] - seed_eta)
-            dphi = abs(cell_positions[i, 1] - seed_phi)
-            # Handle phi wrapping
-            dphi = min(dphi, 2*np.pi - dphi)
-            
-            if deta < eta_window and dphi < phi_window:
-                # Only mask a fraction to avoid too easy reconstruction
-                if rng.random() < self.mask_ratio * 2:  # Higher probability in window
-                    mask[i] = True
-                    
+    
+        # Vectorized: compute deta/dphi for every cell at once instead of
+        # looping in Python. deta/dphi arrays cover all num_cells in a
+        # handful of numpy calls rather than 187,642 Python-level iterations.
+        deta = np.abs(cell_positions[:, 0] - seed_eta)
+        dphi = np.abs(cell_positions[:, 1] - seed_phi)
+        dphi = np.minimum(dphi, 2 * np.pi - dphi)
+    
+        in_window = (deta < eta_window) & (dphi < phi_window)
+    
+        # Same "higher probability in window" random draw, vectorized.
+        # NOTE: this draws num_cells random values regardless of in_window,
+        # whereas the original only drew rng.random() for cells that passed
+        # the window check. Since rng is a fresh, unseeded RandomState()
+        # created per apply_mask() call (see apply_mask below), the exact
+        # sequence of random draws isn't reproducible either way, so this
+        # doesn't change reproducibility guarantees — just the mechanism.
+        random_draw = rng.random(num_cells) < (self.mask_ratio * 2)
+    
+        mask = in_window & random_draw
         return mask
     
     def _get_cluster_mask(self, num_cells: int, event_id: int,
-                         rng: np.random.RandomState) -> np.ndarray:
-        """Cluster masking - mask all cells belonging to selected clusters."""
-        mask = np.zeros(num_cells, dtype=bool)
-        
-        if event_id not in self.cluster_info_dict:
-            # Fallback to random masking
-            return self._get_random_mask(num_cells, rng)
-        
-        cluster_info = self.cluster_info_dict[event_id]
-        cluster_ids = cluster_info.get('cell_cluster_index', None)
-        
-        if cluster_ids is None:
-            return self._get_random_mask(num_cells, rng)
-        
-        # Get unique cluster IDs (excluding -1 for unclustered)
-        unique_clusters = np.unique(cluster_ids[cluster_ids >= 0])
-        
-        if len(unique_clusters) == 0:
-            return self._get_random_mask(num_cells, rng)
-        
-        # Select clusters to mask
-        n_clusters_to_mask = max(1, int(len(unique_clusters) * self.mask_ratio))
-        clusters_to_mask = rng.choice(unique_clusters, n_clusters_to_mask, replace=False)
-        
-        # Mask all cells in selected clusters
-        for cluster_id in clusters_to_mask:
-            mask[cluster_ids == cluster_id] = True
+                             rng: np.random.RandomState) -> np.ndarray:
+            """Cluster masking - mask all cells belonging to selected clusters."""
+            if event_id not in self.cluster_info_dict:
+                # Fallback to random masking
+                return self._get_random_mask(num_cells, rng)
             
-        return mask
+            cluster_info = self.cluster_info_dict[event_id]
+            cluster_ids = cluster_info.get('cell_cluster_index', None)
+            
+            if cluster_ids is None:
+                return self._get_random_mask(num_cells, rng)
+            
+            # Get unique cluster IDs (excluding 0, which marks unclustered cells)
+            unique_clusters = np.unique(cluster_ids[cluster_ids > 0])
+            
+            if len(unique_clusters) == 0:
+                return self._get_random_mask(num_cells, rng)
+            
+            # Select clusters to mask
+            n_clusters_to_mask = max(1, int(len(unique_clusters) * self.mask_ratio))
+            clusters_to_mask = rng.choice(unique_clusters, n_clusters_to_mask, replace=False)
+            
+            # Vectorized: one membership-test pass over all cells instead of
+            # k separate full-array scans (one per selected cluster).
+            return np.isin(cluster_ids, clusters_to_mask)
     
     def apply_mask(self, features: torch.Tensor, event_id: int = None,
                   feature_names: List[str] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1997,7 +1995,7 @@ def save_results_to_parquet(results, save_path, model_name,
             # whether both nodes belong to the same reconstructed cluster.
             df['same_cluster'] = (
                 (src_cluster == dst_cluster)
-                & (src_cluster >= 0)
+                & (src_cluster > 0)
             )
 
         table = pa.Table.from_pandas(
@@ -2488,14 +2486,12 @@ def train_single_model(args, model_type=None, tracker=None):
     train_loader = DataLoader(
         train_generator, batch_size=args.batch_size,
         collate_fn=MultiClassBatchGenerator.collate_data,
-        pin_memory=True, num_workers=4, persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=True, num_workers=0
     )
     test_loader = DataLoader(
         test_generator, batch_size=args.batch_size,
         collate_fn=MultiClassBatchGenerator.collate_data,
-        pin_memory=True, num_workers=2, persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=True, num_workers=0
     )
     if tracker: tracker.log_measurement("data_loaders_ready")
     
