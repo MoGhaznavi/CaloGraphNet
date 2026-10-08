@@ -20,9 +20,9 @@ import gc
 import glob
 import json
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "6")
-os.environ.setdefault("MKL_NUM_THREADS", "6")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "6")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("MPLBACKEND", "Agg")
 import pickle
 import psutil
@@ -96,7 +96,7 @@ if mp.get_start_method(allow_none=True) != 'spawn':
         pass
 
 torch.backends.cudnn.benchmark = True
-torch.set_num_threads(4)
+torch.set_num_threads(2)
 
 
 # ============================================================================
@@ -203,6 +203,10 @@ def parse_args():
     parser.add_argument('--model', '-m', type=str, default='gcn', choices=['gcn', 'gat', 'transformer', 'sage', 'all'])
     parser.add_argument('--hidden-dim', type=int, default=128)
     parser.add_argument('--layers', '-l', type=int, default=6)
+    parser.add_argument('--multi-scale', action='store_true',
+                        help='Concatenate 1..L-hop GAT outputs and project back, '
+                             'instead of residual-stacking. Requires '
+                             'layers >= 1. Uses one extra Linear(hidden*L, hidden).')
     parser.add_argument('--heads', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--layer-weights', action='store_true')
@@ -253,6 +257,9 @@ def parse_args():
     parser.add_argument('--val-every', type=int, default=5)
     parser.add_argument('--val-events', type=int, default=15)
     parser.add_argument('--anchor-chunk-size', type=int, default=2000)
+    parser.add_argument('--chunk-size', type=int, default=200,
+                    help='Events preloaded per HDF5 chunk. Lower = less '
+                         'peak CPU/RAM, slower per-chunk throughput.')
     parser.add_argument('--candidate-snr-column', type=int, default=2)
     parser.add_argument('--hdbscan-n-jobs', type=int, default=-1)
 
@@ -284,7 +291,27 @@ def parse_args():
                         dest='slot_hungarian')
     parser.add_argument('--slot-no-object-weight', type=float, default=0.1)
     parser.add_argument('--slot-recon-weight', type=float, default=0.0)
-    return parser.parse_args()
+    parser.add_argument('--slot-max-cells', type=int, default=10000,
+                        help='Subsample at most this many cells per event for '
+                             'the slot head. Cells not sampled are assigned to '
+                             'slots by similarity in a cheap second pass. '
+                             'Set to 0 to disable subsampling.')
+    parser.add_argument('--slot-candidate-snr-column', type=int, default=0,
+                        help='Feature column used to prioritize cells for the '
+                             'slot head (default: col 2 = snr_gt2). '
+                             'Set to -1 to sample uniformly at random.')
+    parser.add_argument('--slot-snr-threshold', type=float, default=None,
+                        help='If set, run slot attention only on cells whose '
+                             'priority column >= this value. Non-surviving '
+                             'cells are forced to slot 0. Takes precedence '
+                             'over --slot-max-cells when both are set.')
+    parser.add_argument('--limit-events', type=int, default=0,
+                        help='If > 0, use only this many events (train+test). '
+                             'Useful for quick overfit checks.')
+    args = parser.parse_args()
+    if args.multi_scale and args.model not in ('gat', 'transformer', 'all'):
+        parser.error("--multi-scale requires --model gat or --model transformer")
+    return args
 
 
 # ============================================================================
@@ -753,62 +780,46 @@ def hungarian_slot_loss(attn, target_clusters, no_object_weight=0.1):
     DETR-style bipartite matching between K predicted slots and the unique
     ground-truth cluster IDs for one event.
 
-    Args:
-        attn:             (K, N) soft assignment; columns are per-cell
-                          distributions over slots.
-        target_clusters:  (N,) long, ground-truth cluster IDs. Values <= 0
-                          are treated as noise and excluded from matching.
-        no_object_weight: weight on the entropy penalty for slots that were
-                          not matched to any ground-truth cluster.
-
-    Returns:
-        loss, n_matched, matched_pairs
+    Vectorized version. Returns (loss, n_matched, matched_pairs).
+    Skips the event (returns zero loss) if attn contains NaN or inf.
     """
     from scipy.optimize import linear_sum_assignment
 
     device = attn.device
     K, N = attn.shape
+    zero = attn.sum() * 0.0
 
     valid = target_clusters > 0
-    n_valid = int(valid.sum().item())
-    if n_valid == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True), 0, []
+    if not valid.any() or not torch.isfinite(attn).all():
+        return zero, 0, []
 
-    unique_targets = torch.unique(target_clusters[valid])
-    T = unique_targets.numel()
+    tids, inv = torch.unique(target_clusters[valid], return_inverse=True)
+    T = tids.numel()
+    onehot = F.one_hot(inv, T).float()                # (V, T)
+    counts = onehot.sum(0).clamp(min=1)               # (T,)
+    a_v = attn[:, valid]                              # (K, V)
 
-    # Cost is negative mean attention mass: Hungarian minimizes cost, so it
-    # maximizes the matched (slot, cluster) probability.
-    cost = torch.zeros(K, T, device=device)
-    for j, tid in enumerate(unique_targets):
-        mask_j = (target_clusters == tid)
-        cost[:, j] = -attn[:, mask_j].mean(dim=1)
+    cost = -(a_v @ onehot) / counts                   # (K, T)
+    row, col = linear_sum_assignment(cost.detach().cpu().numpy())
 
-    cost_np = cost.detach().cpu().numpy()
-    row_ind, col_ind = linear_sum_assignment(cost_np)
+    slot_of = torch.full((T,), -1, device=device, dtype=torch.long)
+    slot_of[torch.as_tensor(col, device=device)] = torch.as_tensor(row, device=device)
+    cell_slot = slot_of[inv]
+    ok = cell_slot >= 0
+    cols = torch.arange(a_v.shape[1], device=device)[ok]
+    logp = torch.log(a_v[cell_slot[ok], cols] + 1e-8)
+    per_cluster = (-logp @ onehot[ok]) / counts
+    match_loss = per_cluster.sum() / max(1, len(row))
 
-    matched_slot_for_cluster = {int(c): int(r) for r, c in zip(row_ind, col_ind)}
-    match_loss = torch.tensor(0.0, device=device)
-
-    for c_idx, tid in enumerate(unique_targets):
-        slot = matched_slot_for_cluster.get(c_idx)
-        if slot is None:
-            continue
-        cells_in_cluster = (target_clusters == tid)
-        log_p = torch.log(attn[slot, cells_in_cluster] + 1e-8)
-        match_loss = match_loss - log_p.mean()
-
-    match_loss = match_loss / max(1, T)
-
-    unmatched_slots = [i for i in range(K) if i not in matched_slot_for_cluster.values()]
-    if unmatched_slots:
-        masses = attn[unmatched_slots].sum(dim=1)
-        no_object_loss = masses.mean()
+    unmatched = torch.ones(K, dtype=torch.bool, device=device)
+    unmatched[torch.as_tensor(row, device=device)] = False
+    if unmatched.any():
+        no_obj = attn[unmatched].sum(1).mean() / N
     else:
-        no_object_loss = torch.tensor(0.0, device=device)
+        no_obj = zero
 
-    total = match_loss + no_object_weight * no_object_loss
-    return total, int(T), list(zip(row_ind.tolist(), col_ind.tolist()))
+    total = match_loss + no_object_weight * no_obj
+    return total, int(T), list(zip(row.tolist(), col.tolist()))
 
 
 # ============================================================================
@@ -830,20 +841,61 @@ class GraphFoundationModel(nn.Module):
                  softmax_weights=False, norm_type='batch', debug=False,
                  pretraining=False, feature_names=None,
                  objective='edge_classification', embed_dim=32,
-                 num_slots=64, slot_iterations=3, slot_temperature=1.0):
+                 num_slots=64, slot_iterations=3, slot_temperature=1.0,
+                 multi_scale=False,
+                 slot_max_cells=0,
+                 slot_candidate_snr_column=0,
+                 slot_snr_threshold=None):
         super().__init__()
 
         self.device = device
         self.model_type = model_type
         self.num_layers = num_layers
-        self.layer_weights_enabled = layer_weights
         self.softmax = softmax_weights
         self.pretraining = pretraining
         self.feature_names = feature_names or []
         self.objective = objective
         self.embed_dim = embed_dim
+        self.slot_max_cells = slot_max_cells
+        self.slot_candidate_snr_column = slot_candidate_snr_column
+        self.slot_snr_threshold = slot_snr_threshold
 
         self.node_embedding = nn.Linear(input_dim, hidden_dim)
+
+        # ---- multi-scale guard ----
+        # Concatenating per-layer outputs and projecting back only makes
+        # sense for attention layers (GAT, TransformerConv), where each
+        # layer learns edge-conditioned attention weights. For GCN/SAGE
+        # the same code would run, but the concatenation would mean
+        # something different and untested. Fail fast rather than
+        # silently changing the inductive bias.
+        if multi_scale and model_type not in ('gat', 'transformer'):
+            raise ValueError(
+                f"--multi-scale is only supported for model_type in "
+                f"('gat', 'transformer'); got model_type='{model_type}'. "
+                f"Drop --multi-scale or switch --model."
+            )
+
+        # ---- layer-weights / multi-scale interaction ----
+        # When multi-scale is on, multi_scale_proj already learns a
+        # per-scale linear mixing. Adding scalar layer-weights on top
+        # double-gates the scales: the projection sees a shrunken
+        # contribution, and there's no way for it to recover the
+        # original magnitude. Disable layer weights in this case.
+        if multi_scale and layer_weights:
+            log("⚠️ --multi-scale and --layer-weights are both set. "
+                "Disabling layer weights for this run — multi_scale_proj "
+                "already learns per-scale mixing. Drop --layer-weights "
+                "to silence this warning.")
+            layer_weights = False
+
+        self.multi_scale = multi_scale
+        self.multi_scale_proj = (
+            nn.Linear(hidden_dim * num_layers, hidden_dim)
+            if multi_scale else None
+        )
+        self.layer_weights_enabled = layer_weights
+        self.softmax = softmax_weights
 
         self.convs = nn.ModuleList()
         for _ in range(num_layers):
@@ -955,14 +1007,34 @@ class GraphFoundationModel(nn.Module):
                 [e.to(self.device, non_blocking=True) for e in edge_attr_list], dim=0)
 
         x_embed = self.node_embedding(x_batch)
-        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-            if edge_attr_batch is not None and self.model_type in ['gat', 'transformer']:
-                h = torch.relu(bn(conv(x_embed, edge_index_batch, edge_attr_batch)))
-            else:
-                h = torch.relu(bn(conv(x_embed, edge_index_batch)))
-            if weights is not None:
-                h = weights[i] * h
-            x_embed = x_embed + h
+
+        if self.multi_scale:
+            # Keep every intermediate output; each is a k-hop representation.
+            # Project the concatenation back to hidden_dim so downstream
+            # heads (fc, projection_head, slot_head, recon_head) see the
+            # same shape they always did.
+            scale_outputs = []
+            h = x_embed
+            for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+                if edge_attr_batch is not None and self.model_type in ['gat', 'transformer']:
+                    h_new = torch.relu(bn(conv(h, edge_index_batch, edge_attr_batch)))
+                else:
+                    h_new = torch.relu(bn(conv(h, edge_index_batch)))
+                if weights is not None:
+                    h_new = weights[i] * h_new
+                # Residual within each scale, same as before
+                h = h + h_new
+                scale_outputs.append(h)
+            x_embed = self.multi_scale_proj(torch.cat(scale_outputs, dim=-1))
+        else:
+            for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+                if edge_attr_batch is not None and self.model_type in ['gat', 'transformer']:
+                    h = torch.relu(bn(conv(x_embed, edge_index_batch, edge_attr_batch)))
+                else:
+                    h = torch.relu(bn(conv(x_embed, edge_index_batch)))
+                if weights is not None:
+                    h = weights[i] * h
+                x_embed = x_embed + h
 
         return list(torch.split(x_embed, num_nodes, dim=0))
 
@@ -992,11 +1064,24 @@ class GraphFoundationModel(nn.Module):
                     for emb in node_embeddings]
 
         if self.objective == 'cluster_slots':
-            # Returns list of (K, N_i) attention maps, one per graph.
             out = []
-            for emb in node_embeddings:
-                attn, _slots = self.slot_head(emb)
-                out.append(attn)
+            for emb, x_raw in zip(node_embeddings, x_list):
+                priorities = None
+                col = self.slot_candidate_snr_column
+                if col is not None and col >= 0 and col < x_raw.shape[1]:
+                    priorities = x_raw[:, col].to(emb.device)
+                # Run the slot head in fp32: the cell-dimension softmax
+                # underflows in fp16 when N is large (~5e-6 entries), which
+                # produces NaN in the einsum aggregation and crashes the
+                # Hungarian solver.
+                with torch.autocast(device_type='cuda', enabled=False):
+                    attn, _slots = self.slot_head.forward_with_subsample(
+                        emb.float(),
+                        max_cells=self.slot_max_cells,
+                        snr_priorities=priorities,
+                        snr_threshold=self.slot_snr_threshold,
+                    )
+                out.append(attn.float())
             return out
 
         all_edge_reprs = []
@@ -1085,9 +1170,9 @@ class SlotAttentionClusteringHead(nn.Module):
         self.temperature = temperature
         self.slot_dim = slot_dim
 
-        self.slot_mu = nn.Parameter(
-            torch.randn(1, num_slots, slot_dim) * (slot_dim ** -0.5))
+        self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim))
         self.slot_logsigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
+        nn.init.normal_(self.slot_mu, std=1.0)
 
         self.to_q = nn.Linear(slot_dim, slot_dim)
         self.to_k = nn.Linear(cell_dim, slot_dim)
@@ -1101,10 +1186,7 @@ class SlotAttentionClusteringHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, slot_dim),
         )
-
-        nn.init.xavier_uniform_(self.slot_mu)
-        nn.init.xavier_uniform_(self.slot_logsigma)
-
+        
     def forward(self, cell_tokens: torch.Tensor):
         """
         Args:
@@ -1115,12 +1197,9 @@ class SlotAttentionClusteringHead(nn.Module):
             slots: (K, slot_dim) final slot representations.
         """
         K = self.num_slots
-        if self.training:
-            sigma = self.slot_logsigma.exp()
-            slots = self.slot_mu + sigma * torch.randn_like(self.slot_mu)
-        else:
-            slots = self.slot_mu
-        slots = slots.expand(1, K, self.slot_dim).squeeze(0).contiguous().clone()
+        # Deterministic learned queries (DETR-style). No noise during
+        # training or eval, so no train/eval distribution shift.
+        slots = self.slot_mu.expand(1, K, self.slot_dim).squeeze(0).contiguous().clone()
 
         cells = self.cell_norm(cell_tokens)
         k = self.to_k(cells)
@@ -1152,6 +1231,84 @@ class SlotAttentionClusteringHead(nn.Module):
 
         return attn, slots
 
+    def _assign_all_cells_to_slots(self, cell_tokens, slots, chunk_size=8192):
+        """
+        Assign every cell to a slot using q.k similarity only. No gradient,
+        no iteration. Memory is bounded by chunk_size.
+        """
+        cells = self.cell_norm(cell_tokens)
+        k_full = self.to_k(cells)
+        q = self.to_q(self.slot_norm(slots))
+        scale = self.slot_dim ** 0.5
+
+        N = cell_tokens.shape[0]
+        attn_chunks = []
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            dots = torch.einsum('kd,nd->kn', q, k_full[start:end]) / scale
+            attn_chunks.append(
+                torch.softmax(dots / self.temperature, dim=0))
+        return torch.cat(attn_chunks, dim=1)
+
+    def forward_with_subsample(self, cell_tokens, max_cells=0,
+                               snr_priorities=None, snr_threshold=None):
+        """
+        Run slot attention on at most `max_cells` tokens, then assign the
+        remaining tokens to the nearest slot via q.k similarity.
+
+        Args:
+            cell_tokens:     (N, cell_dim)
+            max_cells:       int; if <= 0 or N <= max_cells, runs the
+                             standard forward on all tokens.
+            snr_priorities:  optional (N,) float tensor. If provided, the
+                             top-`max_cells` tokens by this score form the
+                             subset. Ties are broken arbitrarily.
+            snr_threshold:   optional float. If set, tokens with priority
+                             >= threshold form the subset; the rest are
+                             assigned by similarity without forcing to slot 0.
+
+        Returns:
+            attn:  (K, N) soft assignment over ALL tokens.
+            slots: (K, slot_dim) final slot representations.
+        """
+        N = cell_tokens.shape[0]
+        device = cell_tokens.device
+
+        # --- Threshold mode: pick subset by priority >= threshold ---
+        if snr_threshold is not None and snr_priorities is not None:
+            prio = snr_priorities.to(device).float().flatten()
+            if prio.numel() == N:
+                keep = prio >= snr_threshold
+                if keep.sum() == 0:
+                    keep = torch.zeros_like(keep)
+                    keep[torch.argmax(prio)] = True
+                sub_tokens = cell_tokens[keep]
+                _, slots = self.forward(sub_tokens)
+                attn = self._assign_all_cells_to_slots(cell_tokens, slots)
+                return attn, slots
+
+        # --- Subsample mode: keep only the top-M cells for slot attention ---
+        if max_cells is not None and max_cells > 0 and N > max_cells:
+            if snr_priorities is not None:
+                priorities = snr_priorities.to(device).float().flatten()
+                if priorities.numel() == N:
+                    _, idx = torch.topk(priorities, k=max_cells, largest=True)
+                else:
+                    idx = torch.randperm(N, device=device)[:max_cells]
+            else:
+                idx = torch.randperm(N, device=device)[:max_cells]
+            idx = idx.sort().values
+
+            sub_tokens = cell_tokens[idx]                 # (M, cell_dim)
+            _, slots = self.forward(sub_tokens)           # slot head on subset
+
+            attn = self._assign_all_cells_to_slots(cell_tokens, slots)
+            return attn, slots
+
+        # --- No subsampling: use all cells ---
+        return self.forward(cell_tokens)
+
+        device = cell_tokens.device
 
 # ============================================================================
 # DATA
@@ -1167,7 +1324,8 @@ class MultiClassBatchGenerator(IterableDataset):
     def __init__(self, feature_refs, neighbor_pairs, labels,
                  cells_array, mode="train", is_bi_directional=True,
                  batch_size=1, train_ratio=0.7, debug=False,
-                 cluster_info_dict=None, chunk_size=2000, inference_only=False):
+                 cluster_info_dict=None, chunk_size=2000, inference_only=False,
+                 limit_events=0):
         self.debug = debug
         self.batch_size = batch_size
         self.mode = mode
@@ -1215,6 +1373,9 @@ class MultiClassBatchGenerator(IterableDataset):
             self.event_indices = all_event_ids[:split_idx]
         else:
             self.event_indices = all_event_ids[split_idx:]
+
+        if limit_events and limit_events > 0:
+            self.event_indices = self.event_indices[:limit_events]
 
         pin_msg = " [pinned]" if torch.cuda.is_available() else ""
         log(f"📊 {mode.upper()} SET: {len(self.event_indices)} events "
@@ -1801,6 +1962,10 @@ def train_epoch_cluster_slots(model, loader, optimizer, scaler, device,
 
             loss = loss / accumulation_steps
 
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         if scaler:
             scaler.scale(loss).backward()
         else:
@@ -1809,9 +1974,11 @@ def train_epoch_cluster_slots(model, loader, optimizer, scaler, device,
         if (batch_idx + 1) % accumulation_steps == 0:
             if scaler:
                 scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -2165,6 +2332,22 @@ def run_embedding_inference(model, generator, device,
                 sub_pred[sub_pred <= 0] = 0
                 pred[candidate_mask] = sub_pred
 
+        elif cluster_method == 'cosine_threshold':
+            # Zeroing non-candidate embeddings forces their cosine similarity
+            # to every other cell to be 0 (mathematically dissimilar). This
+            # trick is valid for cosine similarity, unlike for the learned
+            # edge head which was trained on real embeddings.
+            emb_masked = emb_full.copy()
+            emb_masked[~candidate_mask] = 0.0
+            pred = build_clusters_cosine_threshold(
+                emb_masked, eio,
+                cosine_threshold=cosine_threshold,
+                do_split=not no_hierarchical_split,
+                split_strict_factor=split_strict_factor,
+                split_min_subcluster_size=split_min_subcluster_size,
+                split_min_cluster_size=split_min_cluster_size,
+                debug=debug)
+
         elif cluster_method == 'edge_head':
             # Do NOT zero non-candidate embeddings here. Zeroing is a
             # cosine-specific trick (zero vector has 0 dot product with
@@ -2240,6 +2423,21 @@ def run_cluster_slot_inference(model, generator, device, debug=False,
 
         attn_list = model([x_dev], [ei_dev], [None],
                           edge_attr_list=[ea] if ea is not None else None)
+
+        if i == 0 and model.slot_max_cells > 0:
+            N = x_dev.shape[0]
+            col = model.slot_candidate_snr_column
+            if 0 <= col < x_dev.shape[1]:
+                prio = x_dev[:, col].detach().cpu().numpy()
+                if N > model.slot_max_cells:
+                    k = model.slot_max_cells
+                    thresh = np.partition(prio, -k)[-k]
+                else:
+                    thresh = prio.min()
+                log(f"🔎 Slot subsample diag: N={N}, "
+                    f"max_cells={model.slot_max_cells}, "
+                    f"prio column={col}, "
+                    f"priority threshold (top-{model.slot_max_cells})={thresh:.3f}")
         attn = attn_list[0].float().cpu().numpy()
         n_cells = attn.shape[1]
 
@@ -2459,6 +2657,8 @@ def train_embedding_mode(args, model_type, feature_refs, pairs, labels,
         f"_l{args.layers}_d{args.embed_dim}")
     if args.pretrain:
         exp_name += f"_pretrain_{args.mask_type}_r{args.mask_ratio}"
+    if args.multi_scale:
+        exp_name += "_multiscale"
     model_filename = f"{exp_name}.pt"
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -2491,7 +2691,7 @@ def train_embedding_mode(args, model_type, feature_refs, pairs, labels,
         num_heads=args.heads, dropout=args.dropout,
         layer_weights=args.layer_weights, softmax_weights=args.softmax_weights,
         norm_type=args.norm, debug=args.debug, pretraining=False,
-        feature_names=feature_names, objective='embedding',
+        feature_names=feature_names, multi_scale=args.multi_scale, objective='embedding',
         embed_dim=args.embed_dim).to(device)
 
     if args.pretrain:
@@ -2539,12 +2739,18 @@ def train_embedding_mode(args, model_type, feature_refs, pairs, labels,
         feature_refs, pairs, labels, cells,
         mode='train', cluster_info_dict=cluster_info,
         debug=args.debug, is_bi_directional=True,
-        train_ratio=args.train_ratio, chunk_size=2000, inference_only=False)
+        train_ratio=args.train_ratio,
+        chunk_size=args.chunk_size,
+        inference_only=False,
+        limit_events=args.limit_events)
     test_generator = MultiClassBatchGenerator(
         feature_refs, pairs, labels, cells,
         mode='test', cluster_info_dict=cluster_info,
         debug=args.debug, is_bi_directional=True,
-        train_ratio=args.train_ratio, chunk_size=2000, inference_only=False)
+        train_ratio=args.train_ratio,
+        chunk_size=args.chunk_size,
+        inference_only=False,
+        limit_events=args.limit_events)
     train_loader = DataLoader(
         train_generator, batch_size=args.batch_size,
         collate_fn=MultiClassBatchGenerator.collate_data,
@@ -2572,16 +2778,20 @@ def train_embedding_mode(args, model_type, feature_refs, pairs, labels,
             log(f"[Resume] Loaded latest checkpoint {chk_path} "
                 f"(epoch {epoch_num}, best_val_iou={best_val_iou:.4f})")
 
-    # Sanity check: does the first batch actually carry cluster info?
-    first_batch = next(iter(train_loader))
-    first_cluster_infos = first_batch[5]
-    n_with = sum(1 for c in first_cluster_infos
-                 if c is not None and 'cell_cluster_index' in c)
-    log(f"🔎 Cluster-info sanity: {n_with}/{len(first_cluster_infos)} "
-        f"events in first batch have cell_cluster_index")
-    if n_with == 0:
+    # Sanity check: does the first event carry cluster info?
+    # NOTE: we check feature_refs directly rather than pulling a batch from
+    # train_loader. Iterating the chunked IterableDataset to get one sample
+    # preloads the entire first chunk (thousands of HDF5 reads), which at
+    # chunk_size=args.chunk_size costs ~14 minutes on the hh_bbtt_3000_events dataset.
+    # The per-ref 'has_cluster' flag is set during load_features_lazy from
+    # the same HDF5 dataset check, so it gives the identical answer in
+    # milliseconds.
+    has_cluster_first = feature_refs[0].get('has_cluster', False)
+    log(f"🔎 Cluster-info sanity (event 0): "
+        f"{'present' if has_cluster_first else 'MISSING'}")
+    if not has_cluster_first:
         raise RuntimeError(
-            "No cluster info in the first training batch. Contrastive loss "
+            "No cluster info in the first event. Contrastive loss "
             "would silently no-op — refusing to train.")
 
     log(f"\n🚀 Embedding training from epoch {start_epoch} to {args.epochs}...")
@@ -2814,6 +3024,8 @@ def train_cluster_slot_mode(args, model_type, feature_refs, pairs, labels,
     exp_name = args.exp_name or (
         f"{model_name_used}_slots_h{args.hidden_dim}"
         f"_l{args.layers}_k{args.num_slots}")
+    if args.multi_scale:
+        exp_name += "_multiscale"
     model_filename = f"{exp_name}.pt"
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -2839,11 +3051,15 @@ def train_cluster_slot_mode(args, model_type, feature_refs, pairs, labels,
         num_heads=args.heads, dropout=args.dropout,
         layer_weights=args.layer_weights, softmax_weights=args.softmax_weights,
         norm_type=args.norm, debug=args.debug, pretraining=False,
-        feature_names=feature_names, objective='cluster_slots',
+        feature_names=feature_names, multi_scale=args.multi_scale,
+        objective='cluster_slots',
         embed_dim=args.embed_dim,
         num_slots=args.num_slots,
         slot_iterations=args.slot_iterations,
-        slot_temperature=args.slot_temperature).to(device)
+        slot_temperature=args.slot_temperature,
+        slot_max_cells=args.slot_max_cells,
+        slot_candidate_snr_column=args.slot_candidate_snr_column,
+        slot_snr_threshold=args.slot_snr_threshold).to(device)
 
     log(f"   Params: "
         f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -2870,12 +3086,18 @@ def train_cluster_slot_mode(args, model_type, feature_refs, pairs, labels,
         feature_refs, pairs, labels, cells,
         mode='train', cluster_info_dict=cluster_info,
         debug=args.debug, is_bi_directional=True,
-        train_ratio=args.train_ratio, chunk_size=2000, inference_only=False)
+        train_ratio=args.train_ratio,
+        chunk_size=args.chunk_size,
+        inference_only=False,
+        limit_events=args.limit_events)
     test_generator = MultiClassBatchGenerator(
         feature_refs, pairs, labels, cells,
         mode='test', cluster_info_dict=cluster_info,
         debug=args.debug, is_bi_directional=True,
-        train_ratio=args.train_ratio, chunk_size=2000, inference_only=False)
+        train_ratio=args.train_ratio,
+        chunk_size=args.chunk_size,
+        inference_only=False,
+        limit_events=args.limit_events)
     train_loader = DataLoader(
         train_generator, batch_size=args.batch_size,
         collate_fn=MultiClassBatchGenerator.collate_data,
@@ -2903,17 +3125,22 @@ def train_cluster_slot_mode(args, model_type, feature_refs, pairs, labels,
             log(f"[Resume] Loaded latest checkpoint {chk_path} "
                 f"(epoch {epoch_num}, best_val_iou={best_val_iou:.4f})")
 
-    first_batch = next(iter(train_loader))
-    first_cluster_infos = first_batch[5]
-    n_with = sum(1 for c in first_cluster_infos
-                 if c is not None and 'cell_cluster_index' in c)
-    log(f"🔎 Cluster-info sanity: {n_with}/{len(first_cluster_infos)} "
-        f"events in first batch have cell_cluster_index")
-    if n_with == 0 and args.slot_hungarian:
+    # Sanity check: does the first event carry cluster info?
+    # NOTE: we check feature_refs directly rather than pulling a batch from
+    # train_loader. Iterating the chunked IterableDataset to get one sample
+    # preloads the entire first chunk (thousands of HDF5 reads), which at
+    # chunk_size=args.chunk_size costs ~14 minutes on the hh_bbtt_3000_events dataset.
+    # The per-ref 'has_cluster' flag is set during load_features_lazy from
+    # the same HDF5 dataset check, so it gives the identical answer in
+    # milliseconds.
+    has_cluster_first = feature_refs[0].get('has_cluster', False)
+    log(f"🔎 Cluster-info sanity (event 0): "
+        f"{'present' if has_cluster_first else 'MISSING'}")
+    if not has_cluster_first and args.slot_hungarian:
         raise RuntimeError(
-            "Hungarian matching requires cluster info, but no events in the "
-            "first training batch carry cell_cluster_index. Use "
-            "--slot-recon-weight > 0 for unsupervised-only training.")
+            "Hungarian matching requires cluster info, but the first event "
+            "does not carry cell_cluster_index. Use --slot-recon-weight > 0 "
+            "for unsupervised-only training.")
 
     log(f"\n🚀 Cluster-slot training from epoch {start_epoch} to {args.epochs}...")
 
@@ -3144,6 +3371,8 @@ def train_single_model(args, model_type=None, tracker=None):
         exp_name += f"_{args.weight_strategy}"
     if args.pretrain:
         exp_name += f"_pretrain_{args.mask_type}_r{args.mask_ratio}"
+    if args.multi_scale:
+        exp_name += "_multiscale"
     model_filename = f"{exp_name}.pt"
 
     log(f"\n{'='*60}\n🔬 EXPERIMENT: {exp_name}\n{'='*60}")
@@ -3171,7 +3400,7 @@ def train_single_model(args, model_type=None, tracker=None):
             input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
             args.heads, args.dropout, args.layer_weights, args.softmax_weights,
             args.norm, args.debug, pretraining=False,
-            feature_names=feature_names).to(device)
+            feature_names=feature_names, multi_scale=args.multi_scale).to(device)
 
         model_dict = model.state_dict()
         pretrained_dict = {
@@ -3190,7 +3419,8 @@ def train_single_model(args, model_type=None, tracker=None):
             cluster_info_dict=cluster_info,
             debug=args.debug, is_bi_directional=True,
             train_ratio=args.train_ratio,
-            chunk_size=2000, inference_only=False)
+            chunk_size=args.chunk_size, inference_only=False,
+            limit_events=args.limit_events)
 
         _, test_metrics = run_inference(
             model, test_generator, device,
@@ -3236,7 +3466,8 @@ def train_single_model(args, model_type=None, tracker=None):
             num_heads=args.heads, dropout=args.dropout,
             layer_weights=args.layer_weights, softmax_weights=args.softmax_weights,
             norm_type=args.norm, debug=args.debug, pretraining=True,
-            feature_names=feature_names).to(device)
+            feature_names=feature_names,
+            multi_scale=args.multi_scale).to(device)
 
         log(f"   Pretrain params: "
             f"{sum(p.numel() for p in pretrain_model.parameters() if p.requires_grad):,}")
@@ -3256,7 +3487,8 @@ def train_single_model(args, model_type=None, tracker=None):
             feature_refs, pairs, labels, cells, mode='train',
             cluster_info_dict=cluster_info, debug=args.debug,
             is_bi_directional=True, train_ratio=1.0,
-            chunk_size=2000, inference_only=False)
+            chunk_size=args.chunk_size, inference_only=False,
+            limit_events=args.limit_events)
 
         pretrain_loader = DataLoader(
             pretrain_generator, batch_size=args.batch_size,
@@ -3377,7 +3609,8 @@ def train_single_model(args, model_type=None, tracker=None):
             num_heads=args.heads, dropout=args.dropout,
             layer_weights=args.layer_weights, softmax_weights=args.softmax_weights,
             norm_type=args.norm, debug=args.debug, pretraining=False,
-            feature_names=feature_names).to(device)
+            feature_names=feature_names,
+            multi_scale=args.multi_scale).to(device)
 
         pretrained_dict = pretrain_model.state_dict()
         finetune_dict = model.state_dict()
@@ -3396,7 +3629,8 @@ def train_single_model(args, model_type=None, tracker=None):
             input_dim, args.hidden_dim, 5, device, model_name_used, args.layers,
             args.heads, args.dropout, args.layer_weights, args.softmax_weights,
             args.norm, args.debug, pretraining=False,
-            feature_names=feature_names).to(device)
+            feature_names=feature_names,
+            multi_scale=args.multi_scale).to(device)
         log(f"   Params: "
             f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
         if tracker:
@@ -3427,12 +3661,14 @@ def train_single_model(args, model_type=None, tracker=None):
         feature_refs, pairs, labels, cells, mode='train',
         cluster_info_dict=cluster_info, debug=args.debug,
         is_bi_directional=True, train_ratio=args.train_ratio,
-        chunk_size=2000, inference_only=False)
+        chunk_size=args.chunk_size, inference_only=False,
+        limit_events=args.limit_events)
     test_generator = MultiClassBatchGenerator(
         feature_refs, pairs, labels, cells, mode='test',
         cluster_info_dict=cluster_info, debug=args.debug,
         is_bi_directional=True, train_ratio=args.train_ratio,
-        chunk_size=2000, inference_only=False)
+        chunk_size=args.chunk_size, inference_only=False,
+        limit_events=args.limit_events)
     train_loader = DataLoader(
         train_generator, batch_size=args.batch_size,
         collate_fn=MultiClassBatchGenerator.collate_data,
